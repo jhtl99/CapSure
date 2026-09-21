@@ -1,0 +1,17 @@
+# Generated mock clips -- regenerate with: python3 mock-device/gen_clips.py
+mock-device/clips/
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
+
+# PlatformIO (firmware/)
+.pio/
