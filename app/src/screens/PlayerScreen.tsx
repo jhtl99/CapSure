@@ -9,6 +9,7 @@ import {
 } from 'react-native';
 import { Image } from 'expo-image';
 import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
+import { useVideoPlayer, VideoView } from 'expo-video';
 
 import { avDriftMs, frameIndexAt } from '../device/clip';
 import { localClipFile } from '../device/download';
@@ -18,8 +19,71 @@ import type { PreparedClip, PrepareProgress } from '../player/prepare';
 import { Banner, Button, Card, Progress, Row } from '../ui/components';
 import { colors, formatDuration, space, type } from '../ui/theme';
 
+export function PlayerScreen({
+  meta,
+  onBack,
+}: {
+  meta: ClipMeta;
+  onBack: () => void;
+}) {
+  if (meta.format === 'mov') {
+    return <MovPlayer meta={meta} onBack={onBack} />;
+  }
+  return <CapPlayer meta={meta} onBack={onBack} />;
+}
+
 /**
- * Playback.
+ * A QuickTime file downloaded from the mock. The phone already knows how to
+ * play it, so this is the system player rather than the CAPS1 frame clock.
+ */
+function MovPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
+  const file = localClipFile(meta);
+  const player = useVideoPlayer(file.uri, (p) => {
+    p.loop = false;
+  });
+
+  useEffect(() => {
+    setAudioModeAsync({ playsInSilentMode: true }).catch(() => {
+      /* not fatal: audio just respects the ringer switch */
+    });
+  }, []);
+
+  const aspect = meta.width > 0 && meta.height > 0 ? meta.width / meta.height : 16 / 9;
+
+  return (
+    <ScrollView contentContainerStyle={styles.container}>
+      <Text style={type.dim} onPress={onBack}>
+        back to clips
+      </Text>
+
+      <View style={[styles.stage, { aspectRatio: aspect }]}>
+        <VideoView
+          player={player}
+          style={styles.frame}
+          nativeControls
+          contentFit="contain"
+        />
+      </View>
+
+      <Card style={{ marginTop: space.md }}>
+        <Text style={type.heading}>Clip detail</Text>
+        <Row label="File" value={`${meta.id}.mov`} />
+        <Row
+          label="Resolution"
+          value={meta.width && meta.height ? `${meta.width}x${meta.height}` : 'unknown'}
+        />
+        <Row label="Duration" value={formatDuration(meta.duration_ms)} />
+        <Row
+          label="Audio"
+          value={meta.audio_sample_rate ? `${meta.audio_sample_rate} Hz` : 'none'}
+        />
+      </Card>
+    </ScrollView>
+  );
+}
+
+/**
+ * Playback of a CAPS1 clip.
  *
  * The audio file is the clock. Frames carry a pts_us stamped against the same
  * device clock as the audio, so showing the right frame is a binary search into
@@ -27,7 +91,7 @@ import { colors, formatDuration, space, type } from '../ui/theme';
  * keep two timelines in step by hand -- the firmware already did that work by
  * stamping both streams once.
  */
-export function PlayerScreen({
+function CapPlayer({
   meta,
   onBack,
 }: {
@@ -53,7 +117,7 @@ export function PlayerScreen({
       /* not fatal: audio just respects the ringer switch */
     });
 
-    prepareClip(meta.id, localClipFile(meta.id), (p) => {
+    prepareClip(meta.id, localClipFile(meta), (p) => {
       if (!cancelled) setProgress(p);
     })
       .then((p) => {

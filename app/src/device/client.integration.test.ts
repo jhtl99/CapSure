@@ -15,6 +15,7 @@ import { describe, expect, it, beforeAll } from 'vitest';
 
 import { DeviceClient, DeviceApiError, DeviceUnreachableError } from './client';
 import { indexClip, avDriftMs } from './clip';
+import type { ClipMeta } from './types';
 
 const BASE_URL = process.env.CAPSURE_MOCK_URL ?? 'http://localhost:8080';
 
@@ -66,10 +67,16 @@ describe('DeviceClient against the mock', () => {
     }
   });
 
+  async function capsClip(): Promise<ClipMeta | undefined> {
+    const clips = await client().listClips();
+    return clips.find((clip) => clip.format !== 'mov');
+  }
+
   it('serves a clip whose Content-Length matches the listing', async () => {
     if (!reachable) return;
     const c = client();
-    const [clip] = await c.listClips();
+    const clip = await capsClip();
+    if (!clip) return;
     const res = await fetch(c.clipUrl(clip.id));
 
     expect(res.status).toBe(200);
@@ -91,7 +98,8 @@ describe('DeviceClient against the mock', () => {
   it('supports Range requests so an interrupted download can resume', async () => {
     if (!reachable) return;
     const c = client();
-    const [clip] = await c.listClips();
+    const clip = await capsClip();
+    if (!clip) return;
     const from = Math.floor(clip.bytes / 2);
 
     const res = await fetch(c.clipUrl(clip.id), {
@@ -108,7 +116,8 @@ describe('DeviceClient against the mock', () => {
   it('reassembles a clip from two ranged halves', async () => {
     if (!reachable) return;
     const c = client();
-    const [clip] = await c.listClips();
+    const clip = await capsClip();
+    if (!clip) return;
     const mid = Math.floor(clip.bytes / 2);
 
     const [a, b] = await Promise.all([
@@ -122,6 +131,19 @@ describe('DeviceClient against the mock', () => {
 
     // The real test: a clip stitched from two transfers still parses.
     expect(() => indexClip(joined)).not.toThrow();
+  });
+
+  it('serves a QuickTime file when one is in the clips folder', async () => {
+    if (!reachable) return;
+    const c = client();
+    const mov = (await c.listClips()).find((clip) => clip.format === 'mov');
+    if (!mov) return;
+
+    expect(mov.bytes).toBeGreaterThan(0);
+    const res = await fetch(c.clipUrl(mov.id));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('video/quicktime');
+    expect(Number(res.headers.get('content-length'))).toBe(mov.bytes);
   });
 
   it('reports a missing clip as an error the UI can show', async () => {

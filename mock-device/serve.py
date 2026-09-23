@@ -19,6 +19,7 @@ import json
 import os
 import re
 import socket
+import struct
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -32,6 +33,11 @@ FW_VERSION = "0.1.0-mock"
 DEVICE_ID = "capsure-a6-mock"
 
 CLIP_CONTENT_TYPE = "application/x-capsure-clip"
+MOV_CONTENT_TYPE = "video/quicktime"
+
+# QuickTime timestamps are seconds since 1904-01-01 UTC.
+MAC_EPOCH_OFFSET = 2082844800
+CLIP_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
 STATE = {
     "boot_time": time.time(),
@@ -43,15 +49,190 @@ STATE = {
 }
 
 
-def clip_ids():
+def clip_entries():
+    """(clip_id, extension) for every servable file, newest-id first.
+
+    `.cap` is the device format. A `.mov` dropped in the same folder is served
+    as a QuickTime file so a phone can download it. If both exist for one id,
+    the `.cap` wins.
+    """
     if not os.path.isdir(CLIPS_DIR):
         return []
-    ids = [f[:-4] for f in os.listdir(CLIPS_DIR) if f.endswith(".cap")]
-    return sorted(set(ids) - STATE["deleted"], reverse=True)
+    by_id = {}
+    for name in os.listdir(CLIPS_DIR):
+        stem, ext = os.path.splitext(name)
+        ext = ext.lower()
+        if ext not in (".cap", ".mov") or not CLIP_ID_RE.fullmatch(stem):
+            continue
+        if stem not in by_id or ext == ".cap":
+            by_id[stem] = ext
+    ids = sorted(set(by_id) - STATE["deleted"], reverse=True)
+    return [(clip_id, by_id[clip_id]) for clip_id in ids]
+
+
+def clip_ids():
+    return [clip_id for clip_id, _ext in clip_entries()]
 
 
 def clip_path(clip_id):
+    for found_id, ext in clip_entries():
+        if found_id == clip_id:
+            return os.path.join(CLIPS_DIR, clip_id + ext)
     return os.path.join(CLIPS_DIR, f"{clip_id}.cap")
+
+
+def _iter_atoms(buf, start, end):
+    pos = start
+    while pos + 8 <= end:
+        size, typ = struct.unpack_from(">I4s", buf, pos)
+        header = 8
+        if size == 1 and pos + 16 <= end:
+            size = struct.unpack_from(">Q", buf, pos + 8)[0]
+            header = 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            return
+        yield typ, pos + header, pos + size
+        pos += size
+
+
+def _walk_atoms(buf, start, end):
+    for typ, body, end_ in _iter_atoms(buf, start, end):
+        yield typ, body, end_
+        if typ in (b"moov", b"trak", b"mdia", b"minf", b"stbl"):
+            yield from _walk_atoms(buf, body, end_)
+
+
+def mov_info(path):
+    """Duration, size, and rates from a QuickTime file, without decoding it.
+
+    Only the `moov` atom is read. `mdat` (the media) stays on disk.
+    """
+    info = {
+        "created_unix_ms": int(os.path.getmtime(path) * 1000),
+        "duration_ms": 0,
+        "width": 0,
+        "height": 0,
+        "fps": 0,
+        "audio_sample_rate": 0,
+    }
+    file_size = os.path.getsize(path)
+    moov = b""
+    with open(path, "rb") as f:
+        while f.tell() + 8 <= file_size:
+            pos = f.tell()
+            raw = f.read(8)
+            if len(raw) < 8:
+                break
+            size, typ = struct.unpack(">I4s", raw)
+            header = 8
+            if size == 1:
+                ext = f.read(8)
+                if len(ext) < 8:
+                    break
+                size = struct.unpack(">Q", ext)[0]
+                header = 16
+            elif size == 0:
+                size = file_size - pos
+            if size < header or pos + size > file_size:
+                break
+            if typ == b"moov" and size <= 32 * 1024 * 1024:
+                moov = f.read(size - header)
+                break
+            f.seek(pos + size)
+    if not moov:
+        return info
+
+    for typ, body, end in _iter_atoms(moov, 0, len(moov)):
+        if typ == b"mvhd":
+            created, duration_ms = _mvhd(moov, body, end)
+            if created:
+                info["created_unix_ms"] = created
+            info["duration_ms"] = duration_ms
+        elif typ == b"trak":
+            _apply_trak(moov, body, end, info)
+    return info
+
+
+def _mvhd(buf, body, end):
+    if end - body < 20:
+        return 0, 0
+    version = buf[body]
+    if version == 0:
+        created, _modified, timescale, duration = struct.unpack_from(">IIII", buf, body + 4)
+    elif version == 1 and end - body >= 32:
+        created, _modified, timescale, duration = struct.unpack_from(">QQIQ", buf, body + 4)
+    else:
+        return 0, 0
+    created_unix_ms = 0
+    if created > MAC_EPOCH_OFFSET:
+        created_unix_ms = int((created - MAC_EPOCH_OFFSET) * 1000)
+    duration_ms = int(duration * 1000 / timescale) if timescale else 0
+    return created_unix_ms, duration_ms
+
+
+def _apply_trak(buf, start, end, info):
+    handler = None
+    width = height = 0
+    timescale = duration = samples = 0
+    for typ, body, end_ in _walk_atoms(buf, start, end):
+        if typ == b"tkhd":
+            width, height = _tkhd_size(buf, body, end_)
+        elif typ == b"hdlr" and end_ - body >= 12:
+            kind = buf[body + 8:body + 12]
+            # Alias and metadata handlers share a trak with the real one.
+            if kind in (b"vide", b"soun"):
+                handler = kind
+        elif typ == b"mdhd":
+            timescale, duration = _mdhd(buf, body, end_)
+        elif typ == b"stts":
+            samples = _stts_samples(buf, body, end_)
+
+    if handler == b"vide" and width and not info["width"]:
+        info["width"] = width
+        info["height"] = height
+        if samples and timescale and duration:
+            info["fps"] = round(samples * timescale / duration)
+    elif handler == b"soun" and timescale and not info["audio_sample_rate"]:
+        info["audio_sample_rate"] = timescale
+
+
+def _tkhd_size(buf, body, end):
+    version = buf[body]
+    if version == 0 and end - body >= 84:
+        w, h = struct.unpack_from(">II", buf, body + 76)
+    elif version == 1 and end - body >= 96:
+        w, h = struct.unpack_from(">II", buf, body + 88)
+    else:
+        return 0, 0
+    return w >> 16, h >> 16
+
+
+def _mdhd(buf, body, end):
+    version = buf[body]
+    if version == 0 and end - body >= 20:
+        timescale, duration = struct.unpack_from(">II", buf, body + 12)
+    elif version == 1 and end - body >= 32:
+        timescale, duration = struct.unpack_from(">IQ", buf, body + 20)
+    else:
+        return 0, 0
+    return timescale, duration
+
+
+def _stts_samples(buf, body, end):
+    if end - body < 8:
+        return 0
+    count = struct.unpack_from(">I", buf, body + 4)[0]
+    samples = 0
+    pos = body + 8
+    for _ in range(count):
+        if pos + 8 > end:
+            break
+        sample_count, _delta = struct.unpack_from(">II", buf, pos)
+        samples += sample_count
+        pos += 8
+    return samples
 
 
 def clip_meta(clip_id):
@@ -59,6 +240,24 @@ def clip_meta(clip_id):
     if not os.path.exists(path) or clip_id in STATE["deleted"]:
         return None
     size = os.path.getsize(path)
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".mov":
+        info = mov_info(path)
+        return {
+            "id": clip_id,
+            "created_unix_ms": info["created_unix_ms"],
+            "duration_ms": info["duration_ms"],
+            "bytes": size,
+            "width": info["width"],
+            "height": info["height"],
+            "fps": info["fps"],
+            "audio_sample_rate": info["audio_sample_rate"],
+            "format": "mov",
+            "acked": clip_id in STATE["acked"],
+            "complete": True,
+        }
+
     with open(path, "rb") as f:
         h = ClipHeader.unpack(f.read(HEADER_SIZE))
 
@@ -195,11 +394,10 @@ class Handler(BaseHTTPRequestHandler):
     # ---- bodies --------------------------------------------------------
 
     def _serve_preview(self):
-        """Extract the first JPEG out of the newest clip and serve it."""
-        ids = clip_ids()
+        """Extract the first JPEG out of the newest CAPS1 clip and serve it."""
+        ids = [clip_id for clip_id, ext in clip_entries() if ext == ".cap"]
         if not ids:
             return self._err(503, "not_ready", "no frames yet")
-        import struct
         with open(clip_path(ids[0]), "rb") as f:
             f.seek(HEADER_SIZE)
             for _ in range(64):
@@ -224,6 +422,7 @@ class Handler(BaseHTTPRequestHandler):
 
         path = clip_path(clip_id)
         size = meta["bytes"]
+        content_type = MOV_CONTENT_TYPE if meta.get("format") == "mov" else CLIP_CONTENT_TYPE
         start, end = 0, size - 1
         partial = False
 
@@ -248,7 +447,7 @@ class Handler(BaseHTTPRequestHandler):
 
         length = end - start + 1
         self.send_response(206 if partial else 200)
-        self.send_header("Content-Type", CLIP_CONTENT_TYPE)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
         if partial:

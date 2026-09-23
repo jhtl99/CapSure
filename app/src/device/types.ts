@@ -28,6 +28,11 @@ export interface ClipMeta {
   audio_sample_rate: number;
   acked: boolean;
   complete: boolean;
+  /**
+   * Omitted for a CAPS1 clip. `"mov"` means `GET /api/clips/{id}` returns a
+   * QuickTime file, which the phone saves as `{id}.mov`.
+   */
+  format?: 'mov';
 }
 
 export interface ApiErrorBody {

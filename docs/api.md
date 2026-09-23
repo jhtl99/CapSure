@@ -133,6 +133,10 @@ buffer — that is not addressable.
 - `complete` — `false` while the device is still finalizing the clip (the press just
   happened). The app hides incomplete clips from download.
 - `acked` — the app has confirmed a successful full download. See below.
+- `format` — optional. Omitted means the body is a CAPS1 clip. `"mov"` means the
+  body is a QuickTime file. The app saves that download as `{id}.mov` and plays
+  it with the system video player. The mock serves a `.mov` dropped in
+  `mock-device/clips/` this way; the firmware does not.
 
 ---
 
@@ -148,6 +152,10 @@ Content-Type: application/x-capsure-clip
 Content-Length: 21400000
 Accept-Ranges: bytes
 ```
+
+A clip with `"format": "mov"` uses `Content-Type: video/quicktime` instead. The
+body is the file bytes, not a CAPS1 container. `Content-Length` and `Range` still
+apply.
 
 - `Content-Length` is **required** (not chunked encoding) — the app renders a
   progress bar from it.

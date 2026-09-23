@@ -108,7 +108,7 @@ export function GalleryScreen({
   }
 
   function removeLocal(meta: ClipMeta) {
-    deleteLocalClip(meta.id);
+    deleteLocalClip(meta);
     setLocalIds((s) => {
       const next = new Set(s);
       next.delete(meta.id);
@@ -234,7 +234,7 @@ export function GalleryScreen({
 
               {here ? (
                 <Text style={type.dim}>
-                  {`On this phone - ${localClipFile(item.id).size ? formatBytes(localClipFile(item.id).size) : ''}` +
+                  {`On this phone - ${localClipFile(item).size ? formatBytes(localClipFile(item).size) : ''}` +
                     (item.acked ? ' - device may reuse the space' : '')}
                 </Text>
               ) : null}

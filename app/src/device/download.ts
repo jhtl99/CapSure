@@ -28,12 +28,13 @@ export function clipsDirectory(): Directory {
   return dir;
 }
 
-export function localClipFile(id: string): File {
-  return new File(clipsDirectory(), `${id}.cap`);
+export function localClipFile(meta: Pick<ClipMeta, 'id' | 'format'>): File {
+  const ext = meta.format === 'mov' ? 'mov' : 'cap';
+  return new File(clipsDirectory(), `${meta.id}.${ext}`);
 }
 
 export function isDownloaded(meta: ClipMeta): boolean {
-  const file = localClipFile(meta.id);
+  const file = localClipFile(meta);
   if (!file.exists) return false;
   // Size is the cheap integrity check. The real one is parsing it, which
   // happens when the clip is opened.
@@ -52,7 +53,7 @@ export function downloadClip(
   meta: ClipMeta,
   onProgress?: (p: DownloadProgressInfo) => void
 ): DownloadHandle {
-  const destination = localClipFile(meta.id);
+  const destination = localClipFile(meta);
 
   // A leftover partial or stale file would make the download fail outright.
   if (destination.exists) destination.delete();
@@ -81,7 +82,7 @@ export function downloadClip(
   };
 }
 
-export function deleteLocalClip(id: string): void {
-  const file = localClipFile(id);
+export function deleteLocalClip(meta: Pick<ClipMeta, 'id' | 'format'>): void {
+  const file = localClipFile(meta);
   if (file.exists) file.delete();
 }
