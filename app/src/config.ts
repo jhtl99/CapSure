@@ -22,5 +22,21 @@ export const DEFAULT_BASE_URL = MOCK_URL;
 /** Requests to the device time out fast: it is on the same Wi-Fi, or it is gone. */
 export const REQUEST_TIMEOUT_MS = 5000;
 
+/**
+ * The first request after the phone joins the hat's network. DHCP and ARP are
+ * still settling, and the ESP32 is answering between SD writes.
+ */
+export const CONNECT_TIMEOUT_MS = 12000;
+
+/** Missed status polls in a row before the app says the device is gone. */
+export const STATUS_MISSES_BEFORE_LOST = 2;
+
 /** How often the gallery re-checks the device while it is open. */
 export const STATUS_POLL_MS = 5000;
+
+/**
+ * Clip chunks downloaded at once, each on its own connection. Matches
+ * XFER_WORKERS in the firmware. Set to 1 for the old one-at-a-time behaviour,
+ * or when using the mock without --multi-client (it answers overlaps with 503).
+ */
+export const DOWNLOAD_PARALLEL = 4;

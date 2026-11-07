@@ -77,7 +77,8 @@ Serial.printf("PSRAM: %u bytes free\n", ESP.getFreePsram());
 | Camera | OV2640 (on the Sense expansion board) | **outputs JPEG itself** |
 | Mic | PDM mic (on the Sense board) | read over I2S in PDM mode |
 | Storage | microSD on the Sense board | SPI mode |
-| Button | GPIO + interrupt, external pull-up | |
+| Button | GPIO + interrupt, external pull-up | saves a clip; does not touch the radio |
+| Wi-Fi switch | latching, GPIO | AP up only while on. See [`design-decisions.md`](./design-decisions.md) |
 | Indicator LED | GPIO | on whenever `recording == true` |
 
 The single most important property: **the OV2640 compresses to JPEG on the sensor
@@ -97,7 +98,7 @@ stalling the camera.
 | `audio_task`   | 1 | 5 | I2S PDM read, 20 ms blocks, stamp, enqueue |
 | `writer_task`  | 1 | 4 | drain queue to SD as 2-second segments |
 | `http_task`    | 0 | 3 | `esp_http_server`, serves `docs/api.md` |
-| `supervisor`   | 0 | 2 | battery ADC, LED, AP timeout, stats |
+| `supervisor`   | 0 | 2 | battery ADC, LED, Wi-Fi switch, stats |
 
 **Core 1 is the recording side. Core 0 is the radio side.** They communicate only
 through the segment files on the SD card and a small mutex-protected stats struct.
@@ -233,9 +234,10 @@ Three rules that come straight from `api.md` and are easy to get wrong:
 3. **Stream, never buffer.** Read a segment in 8 KB chunks straight to the socket.
    Do not assemble 24 MB anywhere; you do not have 24 MB.
 
-The AP itself should be **off by default** and come up for 5 minutes on a long-press.
-The radio is a large fraction of the power budget, and the proposal's 2-hour claim
-depends on it being off almost always.
+The AP follows the latching Wi-Fi switch: up while the switch is on, radio powered
+down while it is off. The save button does not start Wi-Fi. The 2-hour claim
+depends on that switch staying off while the hat is worn. See
+[`design-decisions.md`](./design-decisions.md).
 
 ---
 
@@ -278,7 +280,7 @@ Roughly in dependency order, each one independently demonstrable:
 5. Ring buffer rotates, runs 10 minutes with `dropped_frames == 0`.
 6. Button press produces a clip index; `/api/clips` lists it.
 7. `GET /api/clips/{id}` streams a full 60 s clip; app plays it. **Integration done.**
-8. Range/resume, ack-driven reclaim, AP duty cycling.
+8. Range/resume, ack-driven reclaim, Wi-Fi switch gates the AP.
 
 Milestone 2 is worth rushing — it is small, and it proves the whole wireless path
 works before either of us has built anything complicated on top of it.

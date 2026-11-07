@@ -33,10 +33,20 @@ demand, so the app's error handling is exercised before the demo.
 
 ```bash
 python3 serve.py --throttle 2000        # 2 MB/s, roughly real ESP32 Wi-Fi
-python3 serve.py --fail-after 3000000   # drop the socket mid-clip (tests resume)
+python3 serve.py --fail-after 3000000   # drop each clip's transfer once mid-clip (tests resume)
 python3 serve.py --offline-after 30     # stop answering, as if the AP timed out
 python3 serve.py --unhealthy            # report dropped frames
+python3 serve.py --multi-client         # serve overlapping requests (the ESP32 will not)
 ```
+
+By default the mock behaves like the ESP32's one-client HTTP server: while a
+request is being served, any overlapping request gets `503 busy`. The app
+queues its requests and retries `busy`, so it should never see one. If the
+mock log shows `!! busy`, something outside the app's client (a browser tab,
+`curl`, a test reading only headers) is holding the slot.
+
+`--fail-after` drops each clip once, so a resuming client can finish. Restart
+the mock to arm it again.
 
 ## A realistic clip
 

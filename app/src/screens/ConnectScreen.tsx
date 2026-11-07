@@ -8,20 +8,24 @@ import {
 } from 'react-native';
 import { Image } from 'expo-image';
 
-import { DeviceClient, DeviceUnreachableError } from '../device/client';
+import { DeviceClient } from '../device/client';
 import type { DeviceStatus } from '../device/types';
-import { DEVICE_URL, MOCK_URL, REQUEST_TIMEOUT_MS } from '../config';
+import { normalizeBaseUrl } from '../device/validate';
+import { CONNECT_TIMEOUT_MS, DEVICE_URL, MOCK_URL, REQUEST_TIMEOUT_MS } from '../config';
 import { Banner, Button, Card, Row } from '../ui/components';
+import { describeError } from '../ui/messages';
 import { colors, space, type } from '../ui/theme';
 
 export function ConnectScreen({
   baseUrl,
   onBaseUrlChange,
   onConnected,
+  onOpenWifiTest,
 }: {
   baseUrl: string;
   onBaseUrlChange: (url: string) => void;
   onConnected: (client: DeviceClient, status: DeviceStatus) => void;
+  onOpenWifiTest: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -35,27 +39,26 @@ export function ConnectScreen({
         baseUrl,
         timeoutMs: REQUEST_TIMEOUT_MS,
       });
-      const status = await client.getStatus();
+      const status = await client.getStatus({ timeoutMs: CONNECT_TIMEOUT_MS });
       // The device has no battery-backed clock. Set it before anything else,
       // or every clip it saves from here on is stamped with nonsense.
       const synced = await client.setTime(Date.now());
       onConnected(client, synced ?? status);
     } catch (e) {
-      setError(
-        e instanceof DeviceUnreachableError
-          ? 'No answer. Is the device awake, and is your phone on its Wi-Fi?'
-          : e instanceof Error
-            ? e.message
-            : String(e)
-      );
+      setError(describeError(e));
     } finally {
       setBusy(false);
     }
   }
 
   function checkCamera() {
-    // Cache-bust so we get a fresh frame rather than a remembered one.
-    setPreview(`${baseUrl.replace(/\/+$/, '')}/api/preview?t=${Date.now()}`);
+    try {
+      // Cache-bust so we get a fresh frame rather than a remembered one.
+      setPreview(`${normalizeBaseUrl(baseUrl)}/api/preview?t=${Date.now()}`);
+      setError(null);
+    } catch (e) {
+      setError(describeError(e));
+    }
   }
 
   return (
@@ -97,6 +100,7 @@ export function ConnectScreen({
       <View style={{ marginTop: space.md, gap: space.sm }}>
         <Button title="Connect" onPress={connect} busy={busy} />
         <Button title="Check camera" variant="secondary" onPress={checkCamera} />
+        <Button title="Wi-Fi test" variant="secondary" onPress={onOpenWifiTest} />
       </View>
 
       {preview ? (

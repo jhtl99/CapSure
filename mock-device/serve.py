@@ -8,8 +8,12 @@ reference to be diffed against.
 
     python3 serve.py                          # http://localhost:8080
     python3 serve.py --throttle 2000          # 2 MB/s, like real Wi-Fi
-    python3 serve.py --fail-after 3000000     # drop the socket mid-clip
+    python3 serve.py --fail-after 3000000     # drop each clip's transfer once, mid-clip
     python3 serve.py --offline-after 60       # pretend the AP timed out
+    python3 serve.py --multi-client           # allow overlapping requests
+
+Like the ESP32, it serves one request at a time and answers any overlapping
+request with 503 `busy`, unless --multi-client is given.
 
 Endpoints: see docs/api.md.
 """
@@ -20,6 +24,9 @@ import os
 import re
 import socket
 import struct
+import subprocess
+import tempfile
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -27,6 +34,8 @@ from capsfile import ClipHeader, HEADER_SIZE, PACKET_SIZE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLIPS_DIR = os.path.join(HERE, "clips")
+THUMBS_DIR = os.path.join(CLIPS_DIR, ".thumbs")
+_THUMB_LOCKS: dict[str, threading.Lock] = {}
 
 API_VERSION = 1
 FW_VERSION = "0.1.0-mock"
@@ -45,8 +54,12 @@ STATE = {
     "clock_set": False,
     "acked": set(),
     "deleted": set(),
+    "dropped": set(),
     "args": None,
 }
+
+# The ESP32's HTTP server has one client slot. Held for a whole request.
+CLIENT_SLOT = threading.Lock()
 
 
 def clip_entries():
@@ -235,6 +248,53 @@ def _stts_samples(buf, body, end):
     return samples
 
 
+def first_jpeg(path):
+    """The first video packet in a CAPS1 file, which is already a JPEG."""
+    with open(path, "rb") as f:
+        f.seek(HEADER_SIZE)
+        for _ in range(256):
+            raw = f.read(PACKET_SIZE)
+            if len(raw) < PACKET_SIZE:
+                return None
+            ptype, _, _, _pts, length = struct.unpack("<BBHII", raw)
+            payload = f.read(length)
+            if ptype == 1 and payload[:2] == b"\xff\xd8":
+                return payload
+    return None
+
+
+def mov_thumbnail(clip_id, src):
+    """A JPEG of the first frame, cached beside the clips.
+
+    macOS Quick Look renders the poster. There is no ffmpeg on a stock Mac,
+    and the phone cannot decode H.264 just to draw a list thumbnail.
+    """
+    os.makedirs(THUMBS_DIR, exist_ok=True)
+    dest = os.path.join(THUMBS_DIR, f"{clip_id}.jpg")
+    lock = _THUMB_LOCKS.setdefault(clip_id, threading.Lock())
+    with lock:
+        if os.path.exists(dest) and os.path.getmtime(dest) >= os.path.getmtime(src):
+            return dest
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                ["qlmanage", "-t", "-s", "640", "-o", tmp, src],
+                capture_output=True,
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.decode(errors="replace") or "qlmanage failed")
+            pngs = [name for name in os.listdir(tmp) if name.lower().endswith(".png")]
+            if not pngs:
+                raise RuntimeError("Quick Look produced no thumbnail")
+            subprocess.run(
+                ["sips", "-s", "format", "jpeg", os.path.join(tmp, pngs[0]), "--out", dest],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+    return dest
+
+
 def clip_meta(clip_id):
     path = clip_path(clip_id)
     if not os.path.exists(path) or clip_id in STATE["deleted"]:
@@ -331,13 +391,32 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):
         print(f"  {self.command:6s} {self.path:40s} {fmt % a}")
 
-    # ---- routing -------------------------------------------------------
-
-    def do_GET(self):
+    def _single_client(self, route):
         if self._offline():
             self.close_connection = True
             return
+        if STATE["args"].multi_client:
+            return route()
+        if not CLIENT_SLOT.acquire(blocking=False):
+            print(f"  !! busy: refused overlapping {self.command} {self.path}")
+            return self._err(503, "busy", "another request is in progress")
+        try:
+            return route()
+        finally:
+            CLIENT_SLOT.release()
 
+    # ---- routing -------------------------------------------------------
+
+    def do_GET(self):
+        return self._single_client(self._get)
+
+    def do_POST(self):
+        return self._single_client(self._post)
+
+    def do_DELETE(self):
+        return self._single_client(self._delete)
+
+    def _get(self):
         if self.path == "/api/status":
             return self._json(200, status_body())
 
@@ -349,17 +428,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/preview":
             return self._serve_preview()
 
+        m = re.fullmatch(r"/api/clips/([A-Za-z0-9_-]{1,32})/thumb", self.path)
+        if m:
+            return self._serve_thumb(m.group(1))
+
         m = re.fullmatch(r"/api/clips/([A-Za-z0-9_-]{1,32})", self.path)
         if m:
             return self._serve_clip(m.group(1))
 
         return self._err(404, "bad_request", f"no route for {self.path}")
 
-    def do_POST(self):
-        if self._offline():
-            self.close_connection = True
-            return
-
+    def _post(self):
         if self.path == "/api/time":
             length = int(self.headers.get("Content-Length", 0))
             try:
@@ -381,7 +460,7 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._err(404, "bad_request", f"no route for {self.path}")
 
-    def do_DELETE(self):
+    def _delete(self):
         m = re.fullmatch(r"/api/clips/([A-Za-z0-9_-]{1,32})", self.path)
         if not m:
             return self._err(404, "bad_request", f"no route for {self.path}")
@@ -393,27 +472,41 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- bodies --------------------------------------------------------
 
+    def _jpeg(self, payload):
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "public, max-age=3600")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _serve_preview(self):
         """Extract the first JPEG out of the newest CAPS1 clip and serve it."""
         ids = [clip_id for clip_id, ext in clip_entries() if ext == ".cap"]
         if not ids:
             return self._err(503, "not_ready", "no frames yet")
-        with open(clip_path(ids[0]), "rb") as f:
-            f.seek(HEADER_SIZE)
-            for _ in range(64):
-                raw = f.read(PACKET_SIZE)
-                if len(raw) < PACKET_SIZE:
-                    break
-                ptype, _, _, _pts, length = struct.unpack("<BBHII", raw)
-                payload = f.read(length)
-                if ptype == 1:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/jpeg")
-                    self.send_header("Content-Length", str(len(payload)))
-                    self.end_headers()
-                    self.wfile.write(payload)
-                    return
-        return self._err(503, "not_ready", "no video frame found")
+        payload = first_jpeg(clip_path(ids[0]))
+        if not payload:
+            return self._err(503, "not_ready", "no video frame found")
+        return self._jpeg(payload)
+
+    def _serve_thumb(self, clip_id):
+        """First frame of one clip, for the gallery and the player reel."""
+        meta = clip_meta(clip_id)
+        if not meta:
+            return self._err(404, "clip_not_found", f"no clip {clip_id}")
+        path = clip_path(clip_id)
+        try:
+            if meta.get("format") == "mov":
+                with open(mov_thumbnail(clip_id, path), "rb") as f:
+                    return self._jpeg(f.read())
+            payload = first_jpeg(path)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+            return self._err(503, "not_ready", f"no thumbnail: {e}")
+        if not payload:
+            return self._err(503, "not_ready", "no video frame found")
+        return self._jpeg(payload)
 
     def _serve_clip(self, clip_id):
         meta = clip_meta(clip_id)
@@ -464,8 +557,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not buf:
                     break
 
-                if args.fail_after and (start + sent + len(buf)) > args.fail_after:
-                    print(f"  !! simulating dropped connection at "
+                # Once per clip, so a client that resumes can finish.
+                if (args.fail_after and clip_id not in STATE["dropped"]
+                        and (start + sent + len(buf)) > args.fail_after):
+                    STATE["dropped"].add(clip_id)
+                    print(f"  !! simulating dropped connection in {clip_id} at "
                           f"{start + sent} bytes")
                     self.close_connection = True
                     return
@@ -516,7 +612,9 @@ def main():
     ap.add_argument("--throttle", type=int, default=0, metavar="KBPS",
                     help="limit transfer speed; 2000 approximates real Wi-Fi")
     ap.add_argument("--fail-after", type=int, default=0, metavar="BYTES",
-                    help="drop the socket mid-clip, to exercise resume")
+                    help="drop each clip's transfer once past this offset, to exercise resume")
+    ap.add_argument("--multi-client", action="store_true",
+                    help="serve overlapping requests instead of answering 503 busy")
     ap.add_argument("--offline-after", type=int, default=0, metavar="SECONDS",
                     help="stop answering, as if the AP timed out")
     ap.add_argument("--unhealthy", action="store_true",
@@ -540,7 +638,9 @@ def main():
     if args.throttle:
         print(f"  throttled to {args.throttle} KB/s")
     if args.fail_after:
-        print(f"  will drop connections after {args.fail_after} bytes")
+        print(f"  will drop each clip's transfer once after {args.fail_after} bytes")
+    if not args.multi_client:
+        print("  single client: overlapping requests get 503 busy")
     print()
 
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()

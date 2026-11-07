@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  PanResponder,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -11,21 +12,181 @@ import { Image } from 'expo-image';
 import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { useVideoPlayer, VideoView } from 'expo-video';
 
+import { DeviceClient } from '../device/client';
 import { avDriftMs, frameIndexAt } from '../device/clip';
-import { localClipFile } from '../device/download';
+import { isDownloaded, localClipFile, partialFraction, pullClip } from '../device/download';
 import type { ClipMeta } from '../device/types';
 import { prepareClip } from '../player/prepare';
 import type { PreparedClip, PrepareProgress } from '../player/prepare';
 import { Banner, Button, Card, Progress, Row } from '../ui/components';
-import { colors, formatDuration, space, type } from '../ui/theme';
+import { ClipThumb } from '../ui/ClipThumb';
+import { describeDownloadError } from '../ui/messages';
+import { colors, formatDuration, formatWhen, space, type } from '../ui/theme';
+
+const SWIPE_PX = 56;
 
 export function PlayerScreen({
+  client,
+  clips,
+  startId,
+  onBack,
+}: {
+  client: DeviceClient;
+  clips: ClipMeta[];
+  startId: string;
+  onBack: () => void;
+}) {
+  const initial = Math.max(0, clips.findIndex((c) => c.id === startId));
+  const [index, setIndex] = useState(initial);
+  const [dragX, setDragX] = useState(0);
+  const indexRef = useRef(initial);
+  const clipsRef = useRef(clips);
+  indexRef.current = index;
+  clipsRef.current = clips;
+
+  const pan = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponderCapture: (_, g) =>
+        Math.abs(g.dx) > 18 && Math.abs(g.dx) > Math.abs(g.dy) * 1.3,
+      onPanResponderMove: (_, g) => setDragX(g.dx),
+      onPanResponderRelease: (_, g) => {
+        const i = indexRef.current;
+        const list = clipsRef.current;
+        if (g.dx <= -SWIPE_PX && i < list.length - 1) setIndex(i + 1);
+        else if (g.dx >= SWIPE_PX && i > 0) setIndex(i - 1);
+        setDragX(0);
+      },
+      onPanResponderTerminate: () => setDragX(0),
+    })
+  ).current;
+
+  const meta = clips[index];
+  const prev = index > 0 ? clips[index - 1] : undefined;
+  const next = index < clips.length - 1 ? clips[index + 1] : undefined;
+  if (!meta) {
+    return (
+      <View style={[styles.container, styles.center]}>
+        <Text style={type.dim} onPress={onBack}>
+          back to clips
+        </Text>
+      </View>
+    );
+  }
+
+  const towardNext = dragX < 0;
+  const pull = Math.min(1, Math.abs(dragX) / 180);
+
+  return (
+    <View style={styles.screen} {...pan.panHandlers}>
+      <View style={{ flex: 1, transform: [{ translateX: dragX * 0.18 }] }}>
+        <ClipStage key={meta.id} client={client} meta={meta} onBack={onBack} />
+      </View>
+
+      {prev || next ? (
+        <View style={[styles.reel, { transform: [{ translateX: dragX * 0.35 }] }]}>
+          <Neighbor
+            client={client}
+            meta={prev}
+            emphasize={!towardNext ? pull : 0}
+            onPress={prev ? () => setIndex(index - 1) : undefined}
+          />
+          <Neighbor
+            client={client}
+            meta={next}
+            emphasize={towardNext ? pull : 0}
+            onPress={next ? () => setIndex(index + 1) : undefined}
+          />
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function Neighbor({
+  client,
+  meta,
+  emphasize,
+  onPress,
+}: {
+  client: DeviceClient;
+  meta?: ClipMeta;
+  emphasize: number;
+  onPress?: () => void;
+}) {
+  if (!meta || !onPress) {
+    return <View style={styles.neighborSlot} />;
+  }
+  const scale = 0.94 + emphasize * 0.1;
+  return (
+    <Pressable onPress={onPress} style={styles.neighborSlot}>
+      <View style={{ transform: [{ scale }], width: '100%' }}>
+        <ClipThumb
+          client={client}
+          clipId={meta.id}
+          durationMs={meta.duration_ms}
+          style={styles.neighborThumb}
+        />
+      </View>
+      <Text style={styles.neighborLabel} numberOfLines={1}>
+        {formatWhen(meta.created_unix_ms)}
+      </Text>
+    </Pressable>
+  );
+}
+
+function ClipStage({
+  client,
   meta,
   onBack,
 }: {
+  client: DeviceClient;
   meta: ClipMeta;
   onBack: () => void;
 }) {
+  const [downloadedId, setDownloadedId] = useState<string | null>(null);
+  const [fraction, setFraction] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const ready = downloadedId === meta.id || isDownloaded(meta);
+
+  async function pull() {
+    setBusy(true);
+    setError(null);
+    let reached = partialFraction(meta);
+    setFraction(reached);
+    try {
+      await pullClip(client, meta, (p) => {
+        reached = p.fraction;
+        setFraction(p.fraction);
+      });
+      setDownloadedId(meta.id);
+    } catch (e) {
+      setError(describeDownloadError(e, reached));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!ready) {
+    return (
+      <View style={styles.container}>
+        <Text style={type.dim} onPress={onBack}>
+          back to clips
+        </Text>
+        <ClipThumb client={client} clipId={meta.id} style={styles.stage} />
+        <Text style={type.heading}>{formatWhen(meta.created_unix_ms)}</Text>
+        <Text style={type.dim}>This clip is still on the device.</Text>
+        {busy ? <Progress fraction={fraction} /> : null}
+        {error ? <Banner tone="bad">{error}</Banner> : null}
+        <Button
+          title={error || partialFraction(meta) > 0 ? 'Resume download' : 'Download'}
+          onPress={pull}
+          busy={busy}
+        />
+      </View>
+    );
+  }
+
   if (meta.format === 'mov') {
     return <MovPlayer meta={meta} onBack={onBack} />;
   }
@@ -278,6 +439,22 @@ function CapPlayer({
 }
 
 const styles = StyleSheet.create({
+  screen: { flex: 1 },
+  reel: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: space.md,
+    paddingHorizontal: space.md,
+    paddingTop: space.sm,
+    paddingBottom: space.md,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+    backgroundColor: colors.bg,
+  },
+  neighborSlot: { flex: 1, gap: 4 },
+  neighborThumb: { width: '100%', aspectRatio: 16 / 9 },
+  neighborLabel: { fontSize: 11, color: colors.textDim },
   container: { padding: space.md, paddingTop: space.xl, gap: space.sm },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   stage: {

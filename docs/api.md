@@ -24,11 +24,14 @@ The device hosts its own Wi-Fi network (SoftAP). The phone joins it to pull clip
 
 **Why SoftAP and not joining a home network:** the use case is walking home at
 night. There is no router there. SoftAP also means zero configuration at demo time.
+Trade studies for this and the other components are in
+[`design-decisions.md`](./design-decisions.md), which overrides the proposal.
 
-**Radio duty cycle:** the AP is **off** by default. A button press (or long-press,
-Ankita's call) brings it up for a 5-minute window, then it shuts down again. This is
-a large part of the 2-hour battery budget. The app must therefore tolerate the device
-being unreachable and tell the user to press the button rather than silently retrying.
+**Radio duty cycle:** the AP follows a latching switch. Switch on means the AP is
+up. Switch off means the radio is powered down. The save button does not change
+the radio. This is a large part of the 2-hour battery budget. The app must
+therefore tolerate the device being unreachable and tell the user to turn the
+Wi-Fi switch on rather than silently retrying.
 
 **Single client.** The device accepts one HTTP client at a time. A second concurrent
 client may receive `503`.
@@ -178,6 +181,13 @@ Deletes immediately. Used by the "delete from device" action in the gallery.
 
 Response: `200`, `{ "deleted": "0042" }`.
 
+### `GET /api/clips/{id}/thumb`
+
+Returns one JPEG (`image/jpeg`): the first video frame of that clip. The app uses
+it as the gallery thumbnail and as the small frames beside the player. A CAPS1
+clip's first video packet is already a JPEG. A QuickTime file is posterized by
+the mock. `404` if the clip does not exist, `503` if no frame can be produced.
+
 ### `GET /api/preview`
 
 Returns a **single** current JPEG frame (`image/jpeg`). Not a stream.
@@ -273,3 +283,4 @@ Bluetooth is not on the table: BLE moves 20-50 KB/s, which puts a 24 MB clip at
 | Version | Date | Change |
 |---|---|---|
 | 1 | 2026-09-21 | Initial contract |
+| 1 | 2026-09-25 | Link layer: AP follows the Wi-Fi switch. HTTP API unchanged, so `api_version` stays 1. |

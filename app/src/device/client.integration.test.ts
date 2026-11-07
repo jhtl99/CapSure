@@ -15,6 +15,7 @@ import { describe, expect, it, beforeAll } from 'vitest';
 
 import { DeviceClient, DeviceApiError, DeviceUnreachableError } from './client';
 import { indexClip, avDriftMs } from './clip';
+import { transferRemaining, verifyClip } from './transfer';
 import type { ClipMeta } from './types';
 
 const BASE_URL = process.env.CAPSURE_MOCK_URL ?? 'http://localhost:8080';
@@ -67,9 +68,13 @@ describe('DeviceClient against the mock', () => {
     }
   });
 
-  async function capsClip(): Promise<ClipMeta | undefined> {
+  async function capsClips(): Promise<ClipMeta[]> {
     const clips = await client().listClips();
-    return clips.find((clip) => clip.format !== 'mov');
+    return clips.filter((clip) => clip.format !== 'mov');
+  }
+
+  async function capsClip(): Promise<ClipMeta | undefined> {
+    return (await capsClips())[0];
   }
 
   it('serves a clip whose Content-Length matches the listing', async () => {
@@ -77,14 +82,25 @@ describe('DeviceClient against the mock', () => {
     const c = client();
     const clip = await capsClip();
     if (!clip) return;
-    const res = await fetch(c.clipUrl(clip.id));
+
+    // `serve.py --fail-after` drops each clip once; the second read is clean.
+    let res!: Response;
+    let bytes!: Uint8Array;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      res = await fetch(c.clipUrl(clip.id));
+      try {
+        bytes = new Uint8Array(await res.arrayBuffer());
+        break;
+      } catch (e) {
+        if (attempt === 1) throw e;
+      }
+    }
 
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('application/x-capsure-clip');
     expect(res.headers.get('accept-ranges')).toBe('bytes');
     expect(Number(res.headers.get('content-length'))).toBe(clip.bytes);
 
-    const bytes = new Uint8Array(await res.arrayBuffer());
     expect(bytes.byteLength).toBe(clip.bytes);
 
     const idx = indexClip(bytes);
@@ -111,6 +127,8 @@ describe('DeviceClient against the mock', () => {
       `bytes ${from}-${clip.bytes - 1}/${clip.bytes}`
     );
     expect(Number(res.headers.get('content-length'))).toBe(clip.bytes - from);
+    // An unread body keeps the device's one client slot busy.
+    await res.body?.cancel();
   });
 
   it('reassembles a clip from two ranged halves', async () => {
@@ -120,18 +138,86 @@ describe('DeviceClient against the mock', () => {
     if (!clip) return;
     const mid = Math.floor(clip.bytes / 2);
 
-    const [a, b] = await Promise.all([
-      fetch(c.clipUrl(clip.id), { headers: { Range: `bytes=0-${mid - 1}` } }),
-      fetch(c.clipUrl(clip.id), { headers: { Range: `bytes=${mid}-` } }),
-    ]);
+    // One after the other: the device has one client slot.
+    const a = await c.getClipRange(clip.id, 0, mid - 1, clip.bytes);
+    const b = await c.getClipRange(clip.id, mid, clip.bytes - 1, clip.bytes);
 
     const joined = new Uint8Array(clip.bytes);
-    joined.set(new Uint8Array(await a.arrayBuffer()), 0);
-    joined.set(new Uint8Array(await b.arrayBuffer()), mid);
+    joined.set(a, 0);
+    joined.set(b, mid);
 
     // The real test: a clip stitched from two transfers still parses.
     expect(() => indexClip(joined)).not.toThrow();
   });
+
+  it('downloads a clip in chunks and it verifies, even through a dropped socket', async () => {
+    if (!reachable) return;
+    const c = client();
+    // A clip the other tests leave alone, so a --fail-after drop lands here.
+    const clip = (await capsClips()).at(-1);
+    if (!clip) return;
+
+    const parts: Uint8Array[] = [];
+    await transferRemaining(
+      clip.bytes,
+      0,
+      {
+        fetchRange: (s, e) => c.getClipRange(clip.id, s, e, clip.bytes, { timeoutMs: 15000 }),
+        append: (b) => parts.push(b),
+      },
+      undefined,
+      { chunkBytes: 256 * 1024 }
+    );
+
+    const joined = new Uint8Array(clip.bytes);
+    let at = 0;
+    for (const p of parts) {
+      joined.set(p, at);
+      at += p.byteLength;
+    }
+    expect(() => verifyClip(clip, joined)).not.toThrow();
+  }, 60000);
+
+  it('serves overlapping requests from one client without a busy error', async () => {
+    if (!reachable) return;
+    const c = client();
+    const results = await Promise.all([
+      c.getStatus(),
+      c.listClips(),
+      c.getStatus(),
+      c.listClips(),
+    ]);
+    expect(results).toHaveLength(4);
+  });
+
+  it('answers a second, unqueued client with 503 busy while one is served', async () => {
+    if (!reachable) return;
+    const clip = await capsClip();
+    if (!clip) return;
+    const url = client().clipUrl(clip.id);
+
+    const responses = await Promise.all(
+      Array.from({ length: 4 }, () => fetch(url).then(async (r) => {
+        await r.arrayBuffer();
+        return r.status;
+      }))
+    );
+    // Either the mock is in --multi-client mode (all 200) or it refused the overlap.
+    expect(responses.every((s) => s === 200 || s === 503)).toBe(true);
+    if (responses.includes(503)) expect(responses).toContain(200);
+  }, 30000);
+
+  it('serves a jpeg of each clip\'s first frame', async () => {
+    if (!reachable) return;
+    const c = client();
+    const clips = await c.listClips();
+    expect(clips.length).toBeGreaterThan(0);
+    for (const clip of clips) {
+      const bytes = await c.getThumb(clip.id);
+      expect(bytes[0]).toBe(0xff);
+      expect(bytes[1]).toBe(0xd8);
+    }
+  }, 30000);
 
   it('serves a QuickTime file when one is in the clips folder', async () => {
     if (!reachable) return;
@@ -144,6 +230,7 @@ describe('DeviceClient against the mock', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('video/quicktime');
     expect(Number(res.headers.get('content-length'))).toBe(mov.bytes);
+    await res.body?.cancel();
   });
 
   it('reports a missing clip as an error the UI can show', async () => {

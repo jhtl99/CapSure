@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   FlatList,
+  Pressable,
   RefreshControl,
   StyleSheet,
   Text,
@@ -10,17 +11,18 @@ import {
 import { DeviceClient } from '../device/client';
 import {
   deleteLocalClip,
-  downloadClip,
   isDownloaded,
   localClipFile,
+  partialFraction,
+  pullClip,
 } from '../device/download';
 import type { ClipMeta, DeviceStatus } from '../device/types';
-import { STATUS_POLL_MS } from '../config';
-import { Banner, Button, Card, Progress, Row } from '../ui/components';
+import { Banner, Progress } from '../ui/components';
+import { ClipThumb } from '../ui/ClipThumb';
+import { describeDownloadError, describeError } from '../ui/messages';
 import {
   colors,
   formatBytes,
-  formatDuration,
   formatWhen,
   space,
   type,
@@ -33,16 +35,12 @@ interface DownloadState {
 
 export function GalleryScreen({
   client,
-  status,
   onStatus,
   onOpenClip,
-  onDisconnect,
 }: {
   client: DeviceClient;
-  status: DeviceStatus;
   onStatus: (s: DeviceStatus) => void;
-  onOpenClip: (meta: ClipMeta) => void;
-  onDisconnect: () => void;
+  onOpenClip: (meta: ClipMeta, clips: ClipMeta[]) => void;
 }) {
   const [clips, setClips] = useState<ClipMeta[]>([]);
   const [refreshing, setRefreshing] = useState(false);
@@ -59,7 +57,7 @@ export function GalleryScreen({
       setLocalIds(new Set(list.filter(isDownloaded).map((c) => c.id)));
       setError(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(describeError(e));
     } finally {
       setRefreshing(false);
     }
@@ -67,29 +65,15 @@ export function GalleryScreen({
 
   useEffect(() => {
     void refresh();
-    const t = setInterval(() => {
-      // Status only: re-listing clips on a timer would fight the pull-to-refresh.
-      client
-        .getStatus()
-        .then(onStatus)
-        .catch(() => {
-          /* the device sleeps; the banner already says so */
-        });
-    }, STATUS_POLL_MS);
-    return () => clearInterval(t);
-  }, [client, onStatus, refresh]);
+  }, [refresh]);
 
   async function pull(meta: ClipMeta) {
-    setDownloads((d) => ({ ...d, [meta.id]: { fraction: 0 } }));
-    const handle = downloadClip(client.clipUrl(meta.id), meta, (p) => {
-      setDownloads((d) => ({ ...d, [meta.id]: { fraction: p.fraction } }));
-    });
+    setDownloads((d) => ({ ...d, [meta.id]: { fraction: partialFraction(meta) } }));
 
     try {
-      await handle.promise;
-      // Only ack once the bytes are all here. The device keeps the clip
-      // protected until we do, which is the whole point of the handshake.
-      await client.ackClip(meta.id);
+      await pullClip(client, meta, (p) => {
+        setDownloads((d) => ({ ...d, [meta.id]: { fraction: p.fraction } }));
+      });
       setLocalIds((s) => new Set(s).add(meta.id));
       setDownloads((d) => {
         const next = { ...d };
@@ -97,13 +81,13 @@ export function GalleryScreen({
         return next;
       });
     } catch (e) {
-      setDownloads((d) => ({
-        ...d,
-        [meta.id]: {
-          fraction: d[meta.id]?.fraction ?? 0,
-          error: e instanceof Error ? e.message : String(e),
-        },
-      }));
+      setDownloads((d) => {
+        const fraction = d[meta.id]?.fraction ?? 0;
+        return {
+          ...d,
+          [meta.id]: { fraction, error: describeDownloadError(e, fraction) },
+        };
+      });
     }
   }
 
@@ -116,44 +100,17 @@ export function GalleryScreen({
     });
   }
 
-  const batteryTone =
-    status.battery_pct > 40 ? 'good' : status.battery_pct > 15 ? 'warn' : 'bad';
-
   return (
     <View style={styles.container}>
-      <Card style={{ margin: space.md }}>
-        <View style={styles.headerRow}>
-          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-            <View
-              style={[
-                styles.dot,
-                { backgroundColor: status.recording ? colors.recording : colors.textDim },
-              ]}
-            />
-            <Text style={type.heading}>
-              {status.recording ? 'Buffering' : 'Idle'}
-            </Text>
-          </View>
-          <Text style={type.dim} onPress={onDisconnect}>
-            disconnect
-          </Text>
-        </View>
-
-        <Row label="Battery" value={`${status.battery_pct}%`} tone={batteryTone} />
-        <Row label="Buffer" value={`${status.buffer_seconds}s rolling`} />
-        <Row label="Storage free" value={`${status.storage_free_mb} MB`} />
-        <Row label="Firmware" value={status.fw_version} />
-
-        {!status.buffer_healthy || status.dropped_frames > 0 ? (
-          <Banner tone="warn">
-            {`Buffer is dropping frames (${status.dropped_frames} so far). A press ` +
-              `right now might not capture cleanly.`}
-          </Banner>
-        ) : null}
-      </Card>
+      <View style={styles.header}>
+        <Text style={type.title}>Clips</Text>
+        <Text style={type.dim}>
+          {clips.length === 1 ? '1 clip' : `${clips.length} clips`}
+        </Text>
+      </View>
 
       {error ? (
-        <View style={{ marginHorizontal: space.md }}>
+        <View style={{ marginHorizontal: space.md, marginBottom: space.sm }}>
           <Banner tone="bad">{error}</Banner>
         </View>
       ) : null}
@@ -161,7 +118,7 @@ export function GalleryScreen({
       <FlatList
         data={clips}
         keyExtractor={(c) => c.id}
-        contentContainerStyle={{ padding: space.md, paddingTop: 0, gap: space.sm }}
+        contentContainerStyle={styles.list}
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -170,75 +127,74 @@ export function GalleryScreen({
           />
         }
         ListEmptyComponent={
-          refreshing ? null : (
-            <Card>
+          refreshing ? undefined : (
+            <View style={styles.empty}>
               <Text style={type.heading}>No clips yet</Text>
               <Text style={type.dim}>
                 Press the button on the device to save the last 60 seconds, then
                 pull down to refresh.
               </Text>
-            </Card>
+            </View>
           )
         }
         renderItem={({ item }) => {
           const dl = downloads[item.id];
           const here = localIds.has(item.id);
+          const busy = !!dl && !dl.error;
 
           return (
-            <Card>
-              <View style={styles.headerRow}>
-                <Text style={type.heading}>{formatWhen(item.created_unix_ms)}</Text>
-                <Text style={type.dim}>{formatDuration(item.duration_ms)}</Text>
-              </View>
+            <View style={styles.row}>
+              <Pressable
+                onPress={() => {
+                  if (here) onOpenClip(item, clips);
+                  else if (!busy) void pull(item);
+                }}
+                style={({ pressed }) => [styles.rowMain, pressed && styles.rowPressed]}
+              >
+                <ClipThumb
+                  client={client}
+                  clipId={item.id}
+                  durationMs={item.duration_ms}
+                  style={styles.thumb}
+                />
 
-              <Row
-                label={`${item.width}x${item.height} @ ${item.fps}fps`}
-                value={formatBytes(item.bytes)}
-              />
-
-              {dl && !dl.error ? (
-                <View style={{ gap: 6, marginTop: 4 }}>
-                  <Progress fraction={dl.fraction} />
-                  <Text style={type.dim}>
-                    {`${Math.round(dl.fraction * 100)}% - ` +
-                      `${formatBytes(Math.round(dl.fraction * item.bytes))} of ` +
-                      `${formatBytes(item.bytes)}`}
+                <View style={styles.meta}>
+                  <Text style={type.heading} numberOfLines={1}>
+                    {formatWhen(item.created_unix_ms)}
                   </Text>
-                </View>
-              ) : null}
+                  <Text style={type.dim} numberOfLines={1}>
+                    {item.width && item.height
+                      ? `${item.width}×${item.height} · ${formatBytes(item.bytes)}`
+                      : formatBytes(item.bytes)}
+                  </Text>
 
-              {dl?.error ? <Banner tone="bad">{dl.error}</Banner> : null}
-
-              <View style={{ flexDirection: 'row', gap: space.sm, marginTop: 4 }}>
-                {here ? (
-                  <>
-                    <View style={{ flex: 1 }}>
-                      <Button title="Play" onPress={() => onOpenClip(item)} />
+                  {dl && !dl.error ? (
+                    <View style={{ gap: 4 }}>
+                      <Progress fraction={dl.fraction} />
+                      <Text style={type.dim}>{`${Math.round(dl.fraction * 100)}%`}</Text>
                     </View>
-                    <Button
-                      title="Remove"
-                      variant="secondary"
-                      onPress={() => removeLocal(item)}
-                    />
-                  </>
-                ) : (
-                  <View style={{ flex: 1 }}>
-                    <Button
-                      title={dl?.error ? 'Retry download' : 'Download'}
-                      onPress={() => pull(item)}
-                      busy={!!dl && !dl.error}
-                    />
-                  </View>
-                )}
-              </View>
+                  ) : (
+                    <Text style={[type.dim, here && { color: colors.good }]}>
+                      {here
+                        ? `On this phone · ${formatBytes(localClipFile(item).size)}`
+                        : partialFraction(item) > 0
+                          ? `On device · tap to resume (${Math.round(partialFraction(item) * 100)}%)`
+                          : 'On device · tap to download'}
+                    </Text>
+                  )}
+
+                  {dl?.error ? (
+                    <Text style={{ color: colors.bad, fontSize: 13 }}>{dl.error}</Text>
+                  ) : null}
+                </View>
+              </Pressable>
 
               {here ? (
-                <Text style={type.dim}>
-                  {`On this phone - ${localClipFile(item).size ? formatBytes(localClipFile(item).size) : ''}` +
-                    (item.acked ? ' - device may reuse the space' : '')}
+                <Text style={styles.remove} onPress={() => removeLocal(item)}>
+                  Remove
                 </Text>
               ) : null}
-            </Card>
+            </View>
           );
         }}
       />
@@ -248,10 +204,29 @@ export function GalleryScreen({
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
-  headerRow: {
+  header: {
+    paddingHorizontal: space.md,
+    paddingTop: space.lg,
+    paddingBottom: space.sm,
+    gap: 2,
+  },
+  list: { paddingHorizontal: space.sm, paddingBottom: space.lg },
+  row: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
   },
-  dot: { width: 9, height: 9, borderRadius: 5 },
+  rowMain: {
+    flex: 1,
+    flexDirection: 'row',
+    gap: space.md,
+    alignItems: 'center',
+    paddingVertical: space.sm,
+    paddingHorizontal: space.sm,
+    borderRadius: 12,
+  },
+  rowPressed: { backgroundColor: colors.surface },
+  thumb: { width: 132, height: 84 },
+  meta: { flex: 1, gap: 3 },
+  remove: { color: colors.textDim, fontSize: 12, marginTop: 2 },
+  empty: { padding: space.lg, gap: space.sm },
 });
