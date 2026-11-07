@@ -39,4 +39,4 @@ export const STATUS_POLL_MS = 5000;
  * XFER_WORKERS in the firmware. Set to 1 for the old one-at-a-time behaviour,
  * or when using the mock without --multi-client (it answers overlaps with 503).
  */
-export const DOWNLOAD_PARALLEL = 4;
+export const DOWNLOAD_PARALLEL = 2;

@@ -34,6 +34,7 @@
 #include <WebServer.h>
 #include <esp_wifi.h>
 #include <esp_http_server.h>
+#include <sys/socket.h>
 #include <vector>
 #include <map>
 #include <memory>
@@ -43,6 +44,7 @@
 // ------------------------- configuration -------------------------
 #define SEG_US        2000000LL        // 2-s segments
 #define WINDOW_US     60000000LL       // clip length
+#define GAP_US        500000LL         // a jump this big between packets is a pause (no table), not footage
 #define SAVE_MARGIN   200000LL         // wait until data past T+200 ms is written
 #define MAX_UNPROT    34               // rolling buffer: 34 x 2 s = 68 s
 #define QUEUE_BYTES   (4 * 1024 * 1024)
@@ -58,12 +60,14 @@
 // and polarity are confirmed: driving PWR_HOLD the wrong way could cut power mid-write.
 
 #define WIFI_SWITCH_ENABLED 1          // 0 = ignore D1 and keep the AP up (no switch wired)
+#define ENABLE_WEB8080      0          // Arduino WebServer on :8080, only for the server comparison (~40 KB RAM)
 
 // ---- pool table detection: >= GREEN_ON_PCT of the frame is green -> table ----
-#define DETECT_PERIOD_MS   250         // ~4 checks per second
+#define DETECT_PERIOD_MS   200         // 5 checks per second
 #define GREEN_ON_PCT       10          // spec: at least 10% of the frame
 #define GREEN_OFF_PCT      7           // must drop below this to switch off (hysteresis)
-#define DETECT_CONFIRM     3           // consecutive checks to change state (~0.75 s)
+#define TABLE_LOST_MS      1000        // no green for longer than this -> stop recording
+#define TABLE_GATES_RECORDING 1        // 0 = record all the time; detection is only reported
 // What counts as a green pixel, in HSV. Keep the hue range symmetric around 120
 // (pure green) and inside 60-180, so it only matches pixels where green is the
 // largest channel, and the result does not depend on the decoder's R/B order.
@@ -72,8 +76,12 @@
 #define GREEN_SAT_MIN_PCT  30          // rejects grey/white/skin tones with a faint green tint
 #define GREEN_VAL_MIN      40          // 0-255; rejects near-black pixels, whose hue is noise
 #define WRITER_CORE   1                // was 0 in sdwriteandviewtest
+#define SD_MAX_FILES  10               // open files at once (default 5). Each slot costs ~4 KB of internal RAM:
+                                       // recorder 1 + download workers 4 + indexing/thumb/ack/sum 2-3
 
 #define TARGET_FPS    24               // design choice; the sensor free-runs at ~60 at VGA
+#define CAM_VFLIP     1                // camera is mounted upside down
+#define CAM_HMIRROR   1
 #define CLIP_W        640
 #define CLIP_H        480
 #define AUDIO_RATE    16000
@@ -116,6 +124,12 @@ volatile bool tableDetected = false;
 volatile uint32_t greenPermille = 0;    // last check, tenths of a percent
 volatile uint32_t detectMs = 0, detectChecks = 0;
 volatile bool detVerbose = false;
+volatile bool detEnabled = true;          // 'd' on serial toggles it
+// Footage is only kept while the table is in view. Starts off: nothing is
+// recorded until the first green frame.
+volatile bool recordingActive = !TABLE_GATES_RECORDING;
+volatile int64_t detFrameTs = 0;          // capture time of the frame the detector is checking
+volatile int64_t lastGreenTs = 0;         // capture time of the last frame that had the table
 volatile uint32_t storageFreeMb = 0, storageTotalMb = 0;
 
 // writer-only state
@@ -209,6 +223,7 @@ void cameraTask(void *) {
     if (detWant && detBuf && fb->len <= PREVIEW_MAX) {           // so does the table detector
       memcpy(detBuf, fb->buf, fb->len);
       detLen = fb->len;
+      detFrameTs = ts;
       detWant = false;
       xSemaphoreGive(detReady);
     }
@@ -217,6 +232,8 @@ void cameraTask(void *) {
     // would give 20 fps from a 60 fps sensor (every 3rd frame), so track when
     // the next frame is due and accept one that lands within half a sensor
     // frame of it.
+    if (!recordingActive) { esp_camera_fb_return(fb); continue; }   // no table: not recorded
+
     static int64_t nextDue = 0;
     const int64_t period = 1000000 / TARGET_FPS;
     if (ts + 8000 < nextDue) { esp_camera_fb_return(fb); continue; }
@@ -257,6 +274,7 @@ void audioTask(void *) {
       out[i] = (int16_t)v;
     }
     samples += n;
+    if (!recordingActive) continue;                          // no table: not recorded
     pushPacket(PKT_PCM, ts, (uint8_t *)out, n * 2);
     audioBlocks++;
   }
@@ -312,11 +330,19 @@ bool calibrateDecoder() {
   return true;
 }
 
+// Turn recording (and the LED) on or off. Only the detector and the 'd'
+// command call this.
+void setRecording(bool on, const char *why) {
+  if (recordingActive == on) return;
+  recordingActive = on;
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
+  Serial.printf(">>> %s: %s\n", on ? "RECORDING" : "PAUSED, LED off", why);
+}
+
 void detectTask(void *) {
-  int streak = 0;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(DETECT_PERIOD_MS));
-    if (captureStop) continue;
+    if (captureStop || !detEnabled) continue;
     xSemaphoreTake(detReady, 0);
     detWant = true;
     if (xSemaphoreTake(detReady, pdMS_TO_TICKS(1000)) != pdTRUE) { detWant = false; continue; }
@@ -338,14 +364,19 @@ void detectTask(void *) {
     uint32_t pm = c.green * 1000 / c.total;
     greenPermille = pm;
     detectChecks++;
-    bool want = tableDetected ? pm >= GREEN_OFF_PCT * 10 : pm >= GREEN_ON_PCT * 10;
-    if (want != tableDetected) {
-      if (++streak >= DETECT_CONFIRM) {
-        tableDetected = want; streak = 0;
-        Serial.printf(">>> %s (green %.1f%% of frame)\n", want ? "POOL TABLE DETECTED" : "pool table lost", pm / 10.0);
-      }
-    } else {
-      streak = 0;
+    // Hysteresis: 10% to switch on, but once on, 7% is enough to count as
+    // "still the table" (so a shadow or a player leaning in doesn't stop it).
+    int64_t ft = detFrameTs;
+    bool green = pm >= (tableDetected ? GREEN_OFF_PCT : GREEN_ON_PCT) * 10;
+    if (green) lastGreenTs = ft;
+    if (!tableDetected && green) {
+      tableDetected = true;                                  // on at the first green check
+      Serial.printf(">>> POOL TABLE DETECTED (green %.1f%% of frame)\n", pm / 10.0);
+      if (TABLE_GATES_RECORDING) setRecording(true, "table in view");
+    } else if (tableDetected && !green && ft - lastGreenTs > (int64_t)TABLE_LOST_MS * 1000) {
+      tableDetected = false;                                 // off after > 1 s with no green
+      Serial.printf(">>> pool table lost (no green for %lld ms)\n", (long long)((ft - lastGreenTs) / 1000));
+      if (TABLE_GATES_RECORDING) setRecording(false, "no table for over 1 s");
     }
     if (detVerbose)
       Serial.printf("detect: green %5.1f%% (%lu/%lu px) in %lu ms -> %s\n", pm / 10.0,
@@ -406,7 +437,18 @@ void writeThumb(uint32_t clipId, int64_t S, int64_t T) {
 }
 
 void doSave(int64_t T) {
-  int64_t S = T - WINDOW_US;
+  // The clip is the last 60 s of *recorded* footage. Recording pauses while the
+  // table is out of view, so walk back through the segments until they add up
+  // to 60 s instead of taking the last 60 s of wall-clock time.
+  int64_t S = T - WINDOW_US, have = 0;
+  for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+    if (it->firstTs > T) continue;
+    int64_t segEnd = min(it->lastTs, T);
+    int64_t len = segEnd - it->firstTs;
+    if (have + len >= WINDOW_US) { S = segEnd - (WINDOW_US - have); have = WINDOW_US; break; }
+    have += len;
+    S = it->firstTs;
+  }
   uint32_t clipId = nextClipId++;
   String tmp = clipPath(clipId, "tmp");
   File m = SD.open(tmp, FILE_WRITE);
@@ -427,11 +469,17 @@ void doSave(int64_t T) {
   }
   m.printf("\n  ],\n  \"total_bytes\": %lu\n}\n", (unsigned long)total);
   m.close();
+  if (!n) {
+    SD.remove(tmp);
+    nextClipId--;
+    Serial.println(">>> Nothing saved: no table footage in the last 60 s");
+    return;
+  }
   writeThumb(clipId, S, T);
   String fin = clipPath(clipId, "json");
   SD.rename(tmp, fin);                                     // listing only ever sees whole manifests
-  Serial.printf(">>> Saved clip %04lu: %lu segments, %.1f MB -> %s\n",
-                (unsigned long)clipId, (unsigned long)n, total / 1048576.0, fin.c_str());
+  Serial.printf(">>> Saved clip %04lu: %lu segments, %.1f s of footage over %.1f s, %.1f MB -> %s\n",
+                (unsigned long)clipId, (unsigned long)n, have / 1e6, (T - S) / 1e6, total / 1048576.0, fin.c_str());
 }
 
 void processSaves(int64_t writtenUpTo) {
@@ -475,6 +523,22 @@ void closeSeg() {
   segs.push_back(cur);
   processSaves(cur.lastTs);
   enforceRetention();
+}
+
+// Recording just paused. Close the segment; if every packet in it came after
+// the last frame that had the table, it is only "no table" footage: delete it.
+void closePausedSeg() {
+  uint32_t id = cur.id;
+  bool noTable = cur.firstTs > lastGreenTs;
+  closeSeg();
+  if (noTable && !segs.empty() && segs.back().id == id && segs.back().refs == 0) {
+    SD.remove(segPath(id)); SD.remove(idxPath(id));
+    segs.pop_back();
+    enforceRetention();
+    Serial.printf("    deleted segment %08lu (no table in it)\n", (unsigned long)id);
+  } else {
+    Serial.printf("    closed segment %08lu (ends at the table's last frame + up to 1 s)\n", (unsigned long)id);
+  }
 }
 
 void writePacket(Packet *p) {
@@ -525,6 +589,10 @@ void writerTask(void *) {
     WCmd *c;
     while (xQueueReceive(cmdQ, &c, 0) == pdTRUE) { c->ok = deleteClipFiles(c->clipId); xSemaphoreGive(c->done); }
     if (listReq) { listReq = false; listClips(); }
+    if (!recordingActive && !writerStop && uxQueueMessagesWaiting(pktQ) == 0) {
+      if (segOpen) closePausedSeg();
+      processSaves(INT64_MAX);                               // nothing more is coming: finish saves now
+    }
     if (writerStop && !writerDone && uxQueueMessagesWaiting(pktQ) == 0) {
       if (segOpen) closeSeg();                               // header + .idx written, pending saves processed
       writerDone = true;
@@ -636,6 +704,7 @@ std::shared_ptr<ClipIdx> buildClip(uint32_t id, const char **err) {
 
   std::vector<SegPkt> sp;
   int64_t t0 = -1; uint32_t lastRel = 0;
+  int64_t prevTs = -1, shift = 0;                           // pause gaps removed so far
   uint64_t out = 32;
   uint32_t nVideo = 0; int64_t vFirst = 0, vLast = 0; bool hasAudio = false;
 
@@ -650,14 +719,19 @@ std::shared_ptr<ClipIdx> buildClip(uint32_t id, const char **err) {
         if (!np) { *err = "storage_error"; return nullptr; }
         c->p = np;
       }
-      if (t0 < 0) t0 = e.ts;
-      int64_t rel = e.ts - t0;
+      // A jump of more than GAP_US is a pause (table out of view): close it up,
+      // leaving one frame's worth of time, so playback doesn't freeze.
+      if (prevTs >= 0 && e.ts - prevTs > GAP_US) shift += e.ts - prevTs - 1000000 / TARGET_FPS;
+      if (e.ts > prevTs) prevTs = e.ts;
+      int64_t adj = e.ts - shift;
+      if (t0 < 0) t0 = adj;
+      int64_t rel = adj - t0;
       uint32_t r = rel < (int64_t)lastRel ? lastRel : (uint32_t)rel;   // CAPS1 needs non-decreasing pts
       lastRel = r;
       OutPkt &o = c->p[c->n++];
       o.seg = sid; o.src = e.off; o.len = e.len; o.out = (uint32_t)out; o.pts = r; o.type = e.type;
       out += 12 + e.len;
-      if (e.type == PKT_JPEG) { if (!nVideo) vFirst = e.ts; vLast = e.ts; nVideo++; }
+      if (e.type == PKT_JPEG) { if (!nVideo) vFirst = adj; vLast = adj; nVideo++; }
       else hasAudio = true;
     }
   }
@@ -778,7 +852,7 @@ String statusJson() {
   j += "\"device_id\":\"capsure-a6-01\",";
   j += "\"fw_version\":\"0.2.0\",";
   j += "\"uptime_s\":" + String((unsigned long)(esp_timer_get_time() / 1000000)) + ",";
-  j += "\"recording\":true,";
+  j += String("\"recording\":") + (recordingActive ? "true" : "false") + ",";
   j += String("\"buffer_healthy\":") + (bufferHealthy ? "true" : "false") + ",";
   j += "\"buffer_seconds\":" + String(min(unprotCount * 2, 60)) + ",";
   j += "\"battery_pct\":100,";                               // TODO: Clarence's battery ADC
@@ -872,6 +946,7 @@ String xferJson(const XferStats &x) {
   return String(b);
 }
 
+#define API_BUF (8 * 1024)                                  // :80 inline-path send buffer
 httpd_handle_t api = nullptr;
 uint8_t *apiOut;                                            // send buffer (httpd runs one handler at a time)
 SegReader *apiReader;
@@ -1002,7 +1077,10 @@ static esp_err_t serveClipWith(httpd_req_t *req, uint32_t id, uint8_t *out, size
     if (captureStop) { x.ok = false; break; }                // shutting down
     size_t k = min((uint64_t)outCap, left);
     int64_t a = esp_timer_get_time();
-    if (!clipRead(*c, off, out, k, rdr)) { x.ok = false; break; }
+    if (!clipRead(*c, off, out, k, rdr)) {
+      Serial.printf("[%s] SD read failed at byte %llu (too many open files? card busy?)\n", x.what, (unsigned long long)off);
+      x.ok = false; break;
+    }
     int64_t b = esp_timer_get_time();
     if (!sendAll(req, out, k)) { x.ok = false; break; }
     int64_t e = esp_timer_get_time();
@@ -1047,7 +1125,7 @@ static bool parseClipUri(const char *uri, uint32_t *id, String *suffix) {
 }
 
 static esp_err_t serveClip(httpd_req_t *req, uint32_t id) {
-  return serveClipWith(req, id, apiOut, IO_BUF, *apiReader);
+  return serveClipWith(req, id, apiOut, API_BUF, *apiReader);
 }
 
 // ---- parallel clip downloads ----
@@ -1071,7 +1149,14 @@ void xferWorker(void *) {
     xferActive++;
     esp_err_t r = serveClipWith(j.req, j.id, out, WORKER_OUT, rdr);
     xferActive--;
-    if (r != ESP_OK) httpd_sess_trigger_close(api, httpd_req_to_sockfd(j.req));   // don't leave a half-sent body open
+    if (r != ESP_OK) {
+      // The header promised Content-Length bytes; if we stop short, the phone
+      // would wait for the rest until it times out. Reset the connection so it
+      // fails immediately and the app retries that chunk.
+      int fd = httpd_req_to_sockfd(j.req);
+      shutdown(fd, SHUT_RDWR);
+      httpd_sess_trigger_close(api, fd);
+    }
     httpd_req_async_handler_complete(j.req);
   }
 }
@@ -1144,7 +1229,7 @@ static esp_err_t hBenchRam(httpd_req_t *req) {
   int64_t t0 = esp_timer_get_time();
   x.ok = true;
   for (uint64_t left = total; left;) {
-    size_t k = min((uint64_t)IO_BUF, left);
+    size_t k = min((uint64_t)API_BUF, left);
     int64_t b = esp_timer_get_time();
     if (!sendAll(req, apiOut, k)) { x.ok = false; break; }
     int64_t e = esp_timer_get_time();
@@ -1173,7 +1258,7 @@ static esp_err_t hBenchSd(httpd_req_t *req) {
   x.ok = true;
   for (uint64_t off = 0; off < want;) {
     if (captureStop) { x.ok = false; break; }                // shutting down
-    size_t k = min((uint64_t)IO_BUF, want - off);
+    size_t k = min((uint64_t)API_BUF, want - off);
     int64_t a = esp_timer_get_time();
     if (!clipRead(*c, off, apiOut, k, *apiReader)) { x.ok = false; break; }
     int64_t b = esp_timer_get_time();
@@ -1223,9 +1308,9 @@ static void regUri(const char *uri, httpd_method_t m, HandlerFn h) {
 }
 
 void startApi() {
-  apiOut = (uint8_t *)heap_caps_malloc(IO_BUF, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-  memset(apiOut, 0xA5, IO_BUF);
-  apiReader = new SegReader();
+  apiOut = (uint8_t *)heap_caps_malloc(API_BUF, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  memset(apiOut, 0xA5, API_BUF);
+  apiReader = new SegReader(4 * 1024);
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 80;
@@ -1417,7 +1502,7 @@ void apStart() {
   WiFi.mode(WIFI_AP);
   applyRadio(reqChannel, reqBw);
   Serial.print(">>> Wi-Fi ON, AP up, IP: "); Serial.println(WiFi.softAPIP());
-  if (!serversStarted) { startApi(); startWeb(); serversStarted = true; }
+  if (!serversStarted) { startApi(); if (ENABLE_WEB8080) startWeb(); serversStarted = true; }
   apOn = true;
 }
 
@@ -1459,7 +1544,7 @@ void safeShutdown() {
                 (unsigned long)dropped);
 
   // 4. Network off. Running transfers saw captureStop and stopped reading SD.
-  if (serversStarted) { httpd_stop(api); web.stop(); }
+  if (serversStarted) { httpd_stop(api); if (ENABLE_WEB8080) web.stop(); }
   delay(200);
   if (apOn) apStop();
   Serial.println("    4/5 servers and Wi-Fi off");
@@ -1502,7 +1587,9 @@ void setup() {
   bool sdOk = false;
   for (int attempt = 0; attempt < 8 && !sdOk; attempt++) {
     uint32_t hz = sdHz[min(attempt / 2, 3)];
-    sdOk = SD.begin(21, SPI, hz);
+    // max_files: the library default is 5, and the recorder (1) + each
+    // download worker (1 each) + indexing/thumbs/acks all hold files open.
+    sdOk = SD.begin(21, SPI, hz, "/sd", SD_MAX_FILES);
     Serial.printf("SD mount at %lu MHz: %s\n", (unsigned long)(hz / 1000000), sdOk ? "OK" : "failed");
     if (!sdOk) { SD.end(); delay(300); }
   }
@@ -1510,6 +1597,7 @@ void setup() {
   const char *types[] = {"none", "MMC", "SD", "SDHC/SDXC", "unknown"};
   uint8_t ct = SD.cardType();
   Serial.printf("SD card: %s, %llu MB\n", types[min((int)ct, 4)], SD.cardSize() / (1024ULL * 1024));
+  Serial.printf("[heap] after SD mount: %u internal free\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   wbuf = (uint8_t *)malloc(WBUF_SIZE);
   curIdx.reserve(256);
   recoverCard();
@@ -1529,8 +1617,14 @@ void setup() {
   c.jpeg_quality = 12; c.fb_count = 3;
   c.fb_location = CAMERA_FB_IN_PSRAM; c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   if (esp_camera_init(&c) != ESP_OK) fail("Camera init FAILED");
+  Serial.printf("[heap] after camera init: %u internal free\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   sensor_t *s = esp_camera_sensor_get();
   s->set_framesize(s, FRAMESIZE_VGA);
+  // Mounted upside down: rotate 180 degrees on the sensor (free; also fixes
+  // preview, thumbnails and the detector). If text looks mirrored afterwards,
+  // set CAM_HMIRROR to 0.
+  s->set_vflip(s, CAM_VFLIP);
+  s->set_hmirror(s, CAM_HMIRROR);
 
   i2s.setPinsPdmRx(42, 41);
   if (!i2s.begin(I2S_MODE_PDM_RX, AUDIO_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) fail("I2S init FAILED");
@@ -1538,7 +1632,7 @@ void setup() {
   previewBuf = (uint8_t *)ps_malloc(PREVIEW_MAX);
   previewReady = xSemaphoreCreateBinary();
   detBuf = (uint8_t *)ps_malloc(PREVIEW_MAX);
-  det565 = (uint8_t *)malloc(DET_W * DET_H * 2);                      // 9.6 KB, internal RAM
+  det565 = (uint8_t *)ps_malloc(DET_W * DET_H * 2);                   // 9.6 KB; CPU-only, PSRAM is fine
   detReady = xSemaphoreCreateBinary();
   calibrateDecoder();
   idxMux = xSemaphoreCreateMutex();
@@ -1550,7 +1644,8 @@ void setup() {
   xTaskCreatePinnedToCore(detectTask, "detect", 8192, nullptr, 2, nullptr, 0);   // radio core, low priority
 
   attachInterrupt(digitalPinToInterrupt(SAVE_PIN), onSaveButton, FALLING);
-  digitalWrite(LED_PIN, HIGH);
+  digitalWrite(LED_PIN, recordingActive ? HIGH : LOW);
+  if (TABLE_GATES_RECORDING) Serial.println("Waiting for the pool table: recording starts (LED on) when green fills >= 10% of the frame");
 
   if (wifiSwitchOn()) apStart();
   else Serial.println("Wi-Fi switch is OFF (D1 high): AP stays down until D1 goes to GND");
@@ -1560,7 +1655,7 @@ void setup() {
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)ESP.getFreePsram());
   Serial.printf("Pins: save button D0, LED D4, Wi-Fi switch D1 (%s)\n",
                 WIFI_SWITCH_ENABLED ? "LOW = on" : "ignored, AP always on");
-  Serial.println("Recording. Serial: s = save, l = list clips, x = safe shutdown, b = button debug, g = toggle per-check green output, t = table status");
+  Serial.println("Recording. Serial: s = save, l = list clips, x = safe shutdown, b = button debug, d = detection on/off, h = heap, g = toggle per-check green output, t = table status");
 }
 
 void loop() {
@@ -1590,6 +1685,15 @@ void loop() {
     if (ch == 'l') listReq = true;
     if (ch == 'b') { btnDebug = !btnDebug; Serial.printf("button debug %s (D0 = GPIO%d, now %s)\n", btnDebug ? "ON" : "OFF",
                                                        (int)SAVE_PIN, digitalRead(SAVE_PIN) == LOW ? "LOW" : "HIGH"); }
+    if (ch == 'd') {
+      detEnabled = !detEnabled;
+      Serial.printf("table detection %s\n", detEnabled ? "ON" : "OFF");
+      if (!detEnabled) setRecording(true, "detection off, recording everything");
+      else if (TABLE_GATES_RECORDING && !tableDetected) setRecording(false, "detection back on, waiting for the table");
+    }
+    if (ch == 'h') Serial.printf("free internal heap %u (largest block %u), free PSRAM %u\n",
+                                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)ESP.getFreePsram());
     if (ch == 'g') { detVerbose = !detVerbose; Serial.printf("per-check green output %s\n", detVerbose ? "ON" : "OFF"); }
     if (ch == 't') Serial.printf("table %s, green %.1f%%, decode %lu ms, %lu checks\n",
                                  tableDetected ? "DETECTED" : "not detected", greenPermille / 10.0,
@@ -1612,10 +1716,10 @@ void loop() {
     uint32_t f = framesCaptured, a = audioBlocks, d = dropped;
     bufferHealthy = (d == dropHist[hi]);
     dropHist[hi] = d; hi = (hi + 1) % 12;
-    Serial.printf("fps %.1f | audio %.0f blk/s | queue peak %u KB | dropped %lu | worst write %lu ms | rolling %d segs | errors %lu | table %s (green %.1f%%) | wifi %s\n",
+    Serial.printf("fps %.1f | audio %.0f blk/s | queue peak %u KB | dropped %lu | worst write %lu ms | rolling %d segs | errors %lu | table %s (green %.1f%%) | %s | wifi %s\n",
                   (f - lastF) / 5.0, (a - lastA) / 5.0, (unsigned)(peakQueued / 1024),
                   (unsigned long)d, (unsigned long)worstWrite, unprotCount, (unsigned long)writeErrors,
-                  tableDetected ? "YES" : "no", greenPermille / 10.0, apOn ? "on" : "off");
+                  tableDetected ? "YES" : "no", greenPermille / 10.0, recordingActive ? "REC" : "paused", apOn ? "on" : "off");
     lastF = f; lastA = a; lastPrint = millis(); worstWrite = 0;
   }
   if (millis() - lastStorage >= 30000) {                    // f_getfree can be slow; keep it off the hot paths
