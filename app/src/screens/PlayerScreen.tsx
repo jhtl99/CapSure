@@ -21,9 +21,12 @@ import type { PreparedClip, PrepareProgress } from '../player/prepare';
 import { Banner, Button, Card, Progress, Row } from '../ui/components';
 import { ClipThumb } from '../ui/ClipThumb';
 import { describeDownloadError } from '../ui/messages';
-import { colors, formatDuration, formatWhen, space, type } from '../ui/theme';
+import { colors, formatDuration, formatWhen, radius, space, type } from '../ui/theme';
 
 const SWIPE_PX = 56;
+
+/** True while a finger is on the seek bar, so the clip swiper leaves the drag alone. */
+const scrubbing = { active: false };
 
 export function PlayerScreen({
   client,
@@ -47,7 +50,7 @@ export function PlayerScreen({
   const pan = useRef(
     PanResponder.create({
       onMoveShouldSetPanResponderCapture: (_, g) =>
-        Math.abs(g.dx) > 18 && Math.abs(g.dx) > Math.abs(g.dy) * 1.3,
+        !scrubbing.active && Math.abs(g.dx) > 18 && Math.abs(g.dx) > Math.abs(g.dy) * 1.3,
       onPanResponderMove: (_, g) => setDragX(g.dx),
       onPanResponderRelease: (_, g) => {
         const i = indexRef.current;
@@ -170,12 +173,9 @@ function ClipStage({
   if (!ready) {
     return (
       <View style={styles.container}>
-        <Text style={type.dim} onPress={onBack}>
-          back to clips
-        </Text>
+        <TopBar meta={meta} onBack={onBack} />
         <ClipThumb client={client} clipId={meta.id} style={styles.stage} />
-        <Text style={type.heading}>{formatWhen(meta.created_unix_ms)}</Text>
-        <Text style={type.dim}>This clip is still on the device.</Text>
+        <Text style={type.dim}>This shot is still on the hat. The picture above is the moment you pressed the button.</Text>
         {busy ? <Progress fraction={fraction} /> : null}
         {error ? <Banner tone="bad">{error}</Banner> : null}
         <Button
@@ -213,9 +213,7 @@ function MovPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
-      <Text style={type.dim} onPress={onBack}>
-        back to clips
-      </Text>
+      <TopBar meta={meta} onBack={onBack} />
 
       <View style={[styles.stage, { aspectRatio: aspect }]}>
         <VideoView
@@ -243,33 +241,94 @@ function MovPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
   );
 }
 
+/** "‹ Clips" plus the shot's time, at the top of every player state. */
+function TopBar({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
+  return (
+    <View style={styles.topBar}>
+      <Pressable onPress={onBack} hitSlop={12} accessibilityRole="button" accessibilityLabel="Back to clips">
+        <Text style={styles.back}>‹ Clips</Text>
+      </Pressable>
+      <Text style={styles.topTitle} numberOfLines={1}>
+        {meta.created_unix_ms ? formatWhen(meta.created_unix_ms) : `Clip ${meta.id}`}
+      </Text>
+      <View style={{ width: 56 }} />
+    </View>
+  );
+}
+
+const SPEEDS = [1, 0.5, 0.25] as const;
+type Speed = (typeof SPEEDS)[number];
+
+/** A seek bar you can tap or drag, sized from its own layout. */
+function Scrubber({ fraction, onSeek }: { fraction: number; onSeek: (f: number, done: boolean) => void }) {
+  const width = useRef(1);
+  const startX = useRef(0);
+  const onSeekRef = useRef(onSeek);
+  onSeekRef.current = onSeek;
+  const at = (x: number) => Math.max(0, Math.min(1, x / width.current));
+  const pan = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderTerminationRequest: () => false,      // don't hand the drag to the clip swiper
+      // The children ignore touches, so locationX is always relative to the
+      // bar; after that, follow the drag distance rather than locationX.
+      onPanResponderGrant: (e) => {
+        scrubbing.active = true;
+        startX.current = e.nativeEvent.locationX;
+        onSeekRef.current(at(startX.current), false);
+      },
+      onPanResponderMove: (_, g) => onSeekRef.current(at(startX.current + g.dx), false),
+      onPanResponderRelease: (_, g) => {
+        scrubbing.active = false;
+        onSeekRef.current(at(startX.current + g.dx), true);
+      },
+      onPanResponderTerminate: () => {
+        scrubbing.active = false;
+      },
+    })
+  ).current;
+  const pct = `${Math.max(0, Math.min(1, fraction)) * 100}%` as const;
+  return (
+    <View
+      style={styles.scrub}
+      onLayout={(e) => (width.current = Math.max(1, e.nativeEvent.layout.width))}
+      {...pan.panHandlers}
+      accessibilityRole="adjustable"
+      accessibilityLabel="Seek"
+    >
+      <View style={styles.scrubTrack} pointerEvents="none">
+        <View style={[styles.scrubFill, { width: pct }]} />
+      </View>
+      <View style={[styles.scrubKnob, { left: pct }]} pointerEvents="none" />
+    </View>
+  );
+}
+
 /**
- * Playback of a CAPS1 clip.
+ * Playback of a CAPS1 clip, built for reviewing a shot.
  *
- * The audio file is the clock. Frames carry a pts_us stamped against the same
- * device clock as the audio, so showing the right frame is a binary search into
- * the frame list for wherever the audio currently is. Nothing here tries to
- * keep two timelines in step by hand -- the firmware already did that work by
- * stamping both streams once.
+ * At 1x the audio file is the clock: frames carry pts_us from the same device
+ * clock as the audio, so the right frame is a binary search for wherever the
+ * audio is. Slow motion (0.5x, 0.25x) drives the frames from a timer instead
+ * and plays silently; stroke review is about the picture, and pitched-down
+ * audio helps no one. Frame steps pause and move exactly one frame.
  */
-function CapPlayer({
-  meta,
-  onBack,
-}: {
-  meta: ClipMeta;
-  onBack: () => void;
-}) {
+function CapPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
   const [prepared, setPrepared] = useState<PreparedClip | null>(null);
   const [progress, setProgress] = useState<PrepareProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [frame, setFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState<Speed>(1);
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [showDetail, setShowDetail] = useState(false);
 
-  const player = useAudioPlayer(prepared?.audioUri ?? null, {
-    updateInterval: 100,
-  });
-  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const player = useAudioPlayer(prepared?.audioUri ?? null, { updateInterval: 100 });
+  const elapsedRef = useRef(0);
+  const playingRef = useRef(false);
+  const speedRef = useRef<Speed>(1);
+  const lastTick = useRef(0);
 
   // --- unpack the clip ------------------------------------------------
   useEffect(() => {
@@ -277,7 +336,6 @@ function CapPlayer({
     setAudioModeAsync({ playsInSilentMode: true }).catch(() => {
       /* not fatal: audio just respects the ringer switch */
     });
-
     prepareClip(meta.id, localClipFile(meta), (p) => {
       if (!cancelled) setProgress(p);
     })
@@ -287,70 +345,107 @@ function CapPlayer({
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       });
-
     return () => {
       cancelled = true;
     };
   }, [meta.id]);
 
-  // --- drive the frames off the audio clock ---------------------------
+  const showAt = (ms: number) => {
+    if (!prepared) return;
+    elapsedRef.current = ms;
+    setElapsedMs(ms);
+    const i = frameIndexAt(prepared.index.video, ms * 1000);
+    setFrame((prev) => (i === prev ? prev : i));
+  };
+
+  // --- one clock for every speed ---------------------------------------
   useEffect(() => {
     if (!prepared) return;
-
-    function tick() {
-      if (!prepared) return;
-      const timeUs = player.currentTime * 1_000_000;
-      const i = frameIndexAt(prepared.index.video, timeUs);
-      setFrame((prev) => (i === prev ? prev : i));
-      setElapsedMs(player.currentTime * 1000);
-
-      if (player.currentTime * 1000 >= prepared.durationMs - 50) {
+    const hasAudio = !!prepared.audioUri;
+    const tick = () => {
+      const now = Date.now();
+      const dt = now - lastTick.current;
+      lastTick.current = now;
+      if (!playingRef.current) return;
+      let ms: number;
+      if (speedRef.current === 1 && hasAudio) ms = player.currentTime * 1000;
+      else ms = elapsedRef.current + dt * speedRef.current;
+      if (ms >= prepared.durationMs - 30) {
+        ms = prepared.durationMs;
+        playingRef.current = false;
         setPlaying(false);
+        player.pause();
       }
-    }
-
-    // Twice the frame rate: fast enough that no frame is late, cheap enough
-    // that it costs nothing at 480p15.
-    tickRef.current = setInterval(tick, 1000 / (prepared.index.header.fps * 2));
-    return () => {
-      if (tickRef.current) clearInterval(tickRef.current);
+      showAt(ms);
     };
+    lastTick.current = Date.now();
+    const t = setInterval(tick, 1000 / (prepared.index.header.fps * 2));
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prepared, player]);
 
-  function toggle() {
-    if (!prepared) return;
-    if (playing) {
-      player.pause();
-      setPlaying(false);
-    } else {
-      if (player.currentTime * 1000 >= prepared.durationMs - 50) {
-        void player.seekTo(0);
-      }
-      player.play();
-      setPlaying(true);
-    }
+  function startAudioAt(ms: number) {
+    if (!prepared?.audioUri) return;
+    void player.seekTo(ms / 1000);
+    player.play();
   }
 
-  function scrub(fraction: number) {
+  function play() {
     if (!prepared) return;
-    const target = (prepared.durationMs / 1000) * fraction;
-    void player.seekTo(target);
-    setElapsedMs(target * 1000);
-    setFrame(frameIndexAt(prepared.index.video, target * 1_000_000));
+    let from = elapsedRef.current;
+    if (from >= prepared.durationMs - 30) from = 0;
+    showAt(from);
+    lastTick.current = Date.now();
+    playingRef.current = true;
+    setPlaying(true);
+    if (speedRef.current === 1) startAudioAt(from);
+  }
+
+  function pause() {
+    playingRef.current = false;
+    setPlaying(false);
+    player.pause();
+  }
+
+  const toggle = () => (playingRef.current ? pause() : play());
+
+  function changeSpeed(next: Speed) {
+    speedRef.current = next;
+    setSpeed(next);
+    lastTick.current = Date.now();
+    if (!playingRef.current) return;
+    if (next === 1) startAudioAt(elapsedRef.current);
+    else player.pause();
+  }
+
+  function step(dir: -1 | 1) {
+    if (!prepared || !prepared.index.video.length) return;
+    pause();
+    const i = Math.max(0, Math.min(prepared.index.video.length - 1, frame + dir));
+    const ms = prepared.index.video[i].ptsUs / 1000;
+    elapsedRef.current = ms;
+    setElapsedMs(ms);
+    setFrame(i);
+    if (prepared.audioUri) void player.seekTo(ms / 1000);
+  }
+
+  function seek(f: number, done: boolean) {
+    if (!prepared) return;
+    const ms = prepared.durationMs * f;
+    showAt(ms);
+    lastTick.current = Date.now();
+    if (done && playingRef.current && speedRef.current === 1) startAudioAt(ms);
+    else if (prepared.audioUri && done) void player.seekTo(ms / 1000);
   }
 
   if (error) {
     return (
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={type.dim} onPress={onBack}>
-          back
-        </Text>
-        <View style={{ marginTop: space.md }}>
-          <Banner tone="bad">{error}</Banner>
-        </View>
-        <Text style={[type.dim, { marginTop: space.md }]}>
-          A parse failure here usually means the transfer was cut short. Delete
-          the local copy in the gallery and download it again.
+        <TopBar meta={meta} onBack={onBack} />
+        <Banner tone="bad">{error}</Banner>
+        <Text style={type.dim}>
+          This usually means the transfer was cut short. Long-press the clip in the gallery, remove it
+          from this phone, and download it again.
         </Text>
       </ScrollView>
     );
@@ -358,30 +453,33 @@ function CapPlayer({
 
   if (!prepared) {
     return (
-      <View style={[styles.container, styles.center]}>
-        <ActivityIndicator color={colors.accent} />
-        <Text style={[type.dim, { marginTop: space.md }]}>
-          {progress?.stage === 'frames'
-            ? `Unpacking frames ${Math.round((progress.fraction ?? 0) * 100)}%`
-            : progress?.stage === 'audio'
-              ? 'Building audio'
-              : 'Reading clip'}
-        </Text>
+      <View style={[styles.container, { flex: 1 }]}>
+        <TopBar meta={meta} onBack={onBack} />
+        <View style={[styles.center, { gap: space.md }]}>
+          <ActivityIndicator color={colors.accent} />
+          <Text style={type.dim}>
+            {progress?.stage === 'frames'
+              ? `Unpacking frames ${Math.round((progress.fraction ?? 0) * 100)}%`
+              : progress?.stage === 'audio'
+                ? 'Building audio'
+                : 'Opening clip'}
+          </Text>
+        </View>
       </View>
     );
   }
 
+  const fps = prepared.index.header.fps;
+  const nFrames = prepared.index.video.length;
   const drift = avDriftMs(prepared.index);
   const fraction = prepared.durationMs ? elapsedMs / prepared.durationMs : 0;
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
-      <Text style={type.dim} onPress={onBack}>
-        back to clips
-      </Text>
+      <TopBar meta={meta} onBack={onBack} />
 
-      <View style={styles.stage}>
-        {prepared.frameUris.length ? (
+      <Pressable onPress={toggle} style={styles.stage} accessibilityLabel={playing ? 'Pause' : 'Play'}>
+        {nFrames ? (
           <Image
             source={{ uri: prepared.frameUris[frame] }}
             style={styles.frame}
@@ -392,48 +490,72 @@ function CapPlayer({
         ) : (
           <Text style={type.dim}>This clip has no video frames.</Text>
         )}
-      </View>
-
-      <Pressable onPress={(e) => scrub(e.nativeEvent.locationX / 320)}>
-        <Progress fraction={fraction} />
+        {!playing ? (
+          <View style={styles.playOverlay} pointerEvents="none">
+            <Text style={styles.playGlyph}>▶</Text>
+          </View>
+        ) : null}
+        {speed !== 1 ? (
+          <View style={styles.speedTag} pointerEvents="none">
+            <Text style={styles.speedTagText}>{`${speed}× · no sound`}</Text>
+          </View>
+        ) : null}
       </Pressable>
 
+      <Scrubber fraction={fraction} onSeek={seek} />
       <View style={styles.timeRow}>
         <Text style={type.mono}>{formatDuration(elapsedMs)}</Text>
+        <Text style={type.mono}>{`frame ${frame + 1} / ${nFrames}`}</Text>
         <Text style={type.mono}>{formatDuration(prepared.durationMs)}</Text>
       </View>
 
-      <Button title={playing ? 'Pause' : 'Play'} onPress={toggle} />
+      <View style={styles.controls}>
+        <Pressable onPress={() => step(-1)} style={styles.stepBtn} accessibilityLabel="Previous frame">
+          <Text style={styles.stepText}>‹ 1 frame</Text>
+        </Pressable>
+        <Pressable onPress={toggle} style={styles.playBtn} accessibilityLabel={playing ? 'Pause' : 'Play'}>
+          <Text style={styles.playBtnText}>{playing ? 'Pause' : 'Play'}</Text>
+        </Pressable>
+        <Pressable onPress={() => step(1)} style={styles.stepBtn} accessibilityLabel="Next frame">
+          <Text style={styles.stepText}>1 frame ›</Text>
+        </Pressable>
+      </View>
 
-      <Card style={{ marginTop: space.md }}>
-        <Text style={type.heading}>Clip detail</Text>
-        <Row
-          label="Resolution"
-          value={`${prepared.index.header.width}x${prepared.index.header.height}`}
-        />
-        <Row
-          label="Frames"
-          value={`${prepared.index.video.length} @ ${prepared.index.header.fps}fps`}
-        />
-        <Row
-          label="Audio"
-          value={
-            prepared.audioUri
-              ? `${prepared.index.header.audioSampleRate} Hz mono`
-              : 'none'
-          }
-        />
-        <Row label="Frame shown" value={`#${frame}`} />
-        <Row
-          label="A/V drift"
-          value={`${drift >= 0 ? '+' : ''}${drift.toFixed(1)} ms`}
-          tone={Math.abs(drift) > 100 ? 'bad' : Math.abs(drift) > 40 ? 'warn' : 'good'}
-        />
-        <Text style={type.dim}>
-          Drift is how far apart the two streams end. Past about 40 ms a person
-          starts to notice; past 100 ms the clip looks broken.
-        </Text>
-      </Card>
+      <View style={styles.speeds} accessibilityRole="radiogroup">
+        {SPEEDS.map((v) => (
+          <Pressable
+            key={v}
+            onPress={() => changeSpeed(v)}
+            style={[styles.speedChip, speed === v && styles.speedChipOn]}
+            accessibilityRole="radio"
+            accessibilityState={{ selected: speed === v }}
+          >
+            <Text style={[styles.speedText, speed === v && styles.speedTextOn]}>{v === 1 ? 'Normal' : `${v}×`}</Text>
+          </Pressable>
+        ))}
+      </View>
+
+      <Pressable onPress={() => setShowDetail((d) => !d)} style={styles.detailToggle}>
+        <Text style={type.dim}>{showDetail ? 'Hide clip details ▴' : 'Clip details ▾'}</Text>
+      </Pressable>
+      {showDetail ? (
+        <Card>
+          <Row label="Resolution" value={`${prepared.index.header.width}×${prepared.index.header.height}`} />
+          <Row label="Frames" value={`${nFrames} at ${fps} fps`} />
+          <Row
+            label="Audio"
+            value={prepared.audioUri ? `${prepared.index.header.audioSampleRate} Hz mono` : 'none'}
+          />
+          <Row
+            label="A/V drift"
+            value={`${drift >= 0 ? '+' : ''}${drift.toFixed(1)} ms`}
+            tone={Math.abs(drift) > 100 ? 'bad' : Math.abs(drift) > 40 ? 'warn' : 'good'}
+          />
+          <Text style={type.dim}>
+            Drift is how far apart the picture and sound end. Under 40 ms is unnoticeable.
+          </Text>
+        </Card>
+      ) : null}
     </ScrollView>
   );
 }
@@ -455,7 +577,47 @@ const styles = StyleSheet.create({
   neighborSlot: { flex: 1, gap: 4 },
   neighborThumb: { width: '100%', aspectRatio: 16 / 9 },
   neighborLabel: { fontSize: 11, color: colors.textDim },
-  container: { padding: space.md, paddingTop: space.xl, gap: space.sm },
+  container: { padding: space.md, paddingTop: space.md, gap: space.sm },
+  topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: space.xs, minHeight: 36 },
+  back: { color: colors.accent, fontSize: 16, fontWeight: '600', width: 56 },
+  topTitle: { flex: 1, textAlign: 'center', color: colors.text, fontSize: 15, fontWeight: '600' },
+  playOverlay: {
+    position: 'absolute', width: 64, height: 64, borderRadius: 32,
+    backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center',
+  },
+  playGlyph: { color: '#fff', fontSize: 26, marginLeft: 4 },
+  speedTag: {
+    position: 'absolute', left: 8, top: 8, backgroundColor: 'rgba(0,0,0,0.62)',
+    borderRadius: 6, paddingHorizontal: 7, paddingVertical: 2,
+  },
+  speedTagText: { color: '#fff', fontSize: 12, fontWeight: '600' },
+  scrub: { height: 28, justifyContent: 'center' },
+  scrubTrack: { height: 6, borderRadius: 3, backgroundColor: colors.surfaceAlt, overflow: 'hidden' },
+  scrubFill: { height: 6, backgroundColor: colors.accent },
+  scrubKnob: {
+    position: 'absolute', width: 16, height: 16, borderRadius: 8, marginLeft: -8,
+    backgroundColor: colors.text, top: 6,
+  },
+  controls: { flexDirection: 'row', gap: space.sm, alignItems: 'stretch' },
+  stepBtn: {
+    flex: 1, borderRadius: radius.sm, backgroundColor: colors.surfaceAlt,
+    alignItems: 'center', justifyContent: 'center', minHeight: 46,
+  },
+  stepText: { color: colors.text, fontSize: 14, fontWeight: '600' },
+  playBtn: {
+    flex: 1.3, borderRadius: radius.sm, backgroundColor: colors.accent,
+    alignItems: 'center', justifyContent: 'center', minHeight: 46,
+  },
+  playBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  speeds: { flexDirection: 'row', gap: space.sm, justifyContent: 'center', marginTop: space.xs },
+  speedChip: {
+    paddingHorizontal: 14, paddingVertical: 6, borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: colors.border,
+  },
+  speedChipOn: { backgroundColor: colors.surfaceAlt, borderColor: colors.accent },
+  speedText: { color: colors.textDim, fontSize: 13, fontWeight: '600' },
+  speedTextOn: { color: colors.text },
+  detailToggle: { alignSelf: 'center', paddingVertical: space.sm },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   stage: {
     width: '100%',

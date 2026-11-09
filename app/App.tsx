@@ -29,6 +29,8 @@ export default function App() {
 
   const [linkLost, setLinkLost] = useState(false);
   const [wifiTest, setWifiTest] = useState(false);
+  // Off after a deliberate Disconnect, so the connect screen doesn't jump straight back in.
+  const [autoConnect, setAutoConnect] = useState(true);
 
   useEffect(() => {
     if (!client) return;
@@ -59,6 +61,7 @@ export default function App() {
   }, [client]);
 
   function disconnect() {
+    setAutoConnect(false);
     setClient(null);
     setStatus(null);
     setPlayer(null);
@@ -115,6 +118,7 @@ export default function App() {
           baseUrl={baseUrl}
           onBaseUrlChange={setBaseUrl}
           onOpenWifiTest={() => setWifiTest(true)}
+          autoConnect={autoConnect}
           onConnected={(c, s) => {
             setClient(c);
             setStatus(s);

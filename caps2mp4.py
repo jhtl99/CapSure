@@ -4,6 +4,7 @@
 Usage: python3 caps2mp4.py /Volumes/<SD>/caps/clips/clip_0001.json [out.mp4] [--flip] [--keep-gaps]
   --flip       rotate 180 degrees (clips recorded before the firmware flipped the sensor)
   --keep-gaps  keep pauses (table out of view) as frozen frames instead of cutting them
+  --raw        skip the color correction (lifted blacks, low saturation straight off the sensor)
 Requires ffmpeg on PATH (macOS: brew install ffmpeg).
 """
 import argparse, json, shutil, statistics, struct, subprocess, sys, tempfile, wave, zlib
@@ -15,6 +16,13 @@ JPEG, PCM = 1, 2
 NOMINAL_RATE = 16000
 GAP_US = 500_000        # a jump this big between packets is a recording pause, not footage
 FRAME_US = 41_667       # 24 fps: a closed gap keeps one frame's worth of time
+
+# Color correction tuned 11/9 on the CapSure Color Tuning page (same math as the
+# page and the firmware's detector): exposure +0.05 EV, warmer 0.15, magenta 0.20,
+# black point 23%, white point 99%, contrast 1.10, gamma 1.15, saturation 1.55.
+COLOR_FILTER = ("colorchannelmixer=rr=1.0508:gg=1.0146:bb=1.0197,"
+                "colorlevels=rimin=0.23:gimin=0.23:bimin=0.23:rimax=0.99:gimax=0.99:bimax=0.99,"
+                "eq=contrast=1.1:gamma=1.15:saturation=1.55")
 
 
 def read_segment(path, expected_crc):
@@ -33,12 +41,21 @@ def read_segment(path, expected_crc):
     return pkts, ok, npk
 
 
+def video_filter(a, sensor_corrected):
+    # Clips whose manifest says "color": "sensor" were corrected by the camera
+    # itself; correcting them again would crush the blacks.
+    correct = not a.raw and not sensor_corrected
+    chain = (["hflip,vflip"] if a.flip else []) + ([COLOR_FILTER] if correct else [])
+    return ["-vf", ",".join(chain)] if chain else []
+
+
 def main():
     ap = argparse.ArgumentParser(usage=__doc__)
     ap.add_argument("manifest")
     ap.add_argument("out", nargs="?")
     ap.add_argument("--flip", action="store_true")
     ap.add_argument("--keep-gaps", action="store_true")
+    ap.add_argument("--raw", action="store_true")
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     a = ap.parse_args()
@@ -95,6 +112,8 @@ def main():
         if abs(measured - NOMINAL_RATE) / NOMINAL_RATE > 0.01:
             rate = int(round(measured))
             print(f"  -> audio rate is off by >1%; playing it at the measured {rate} Hz so it stays in sync")
+    print("  color: " + ("corrected on the camera, no filter" if m.get("color") == "sensor"
+                         else "raw" if a.raw else "corrected here (COLOR_FILTER)"))
     if not all_ok:
         print("WARNING: at least one segment failed its CRC check")
 
@@ -127,7 +146,7 @@ def main():
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
                         "-f", "concat", "-safe", "0", "-i", str(tmp / "frames.txt"),
                         "-i", str(tmp / "audio.wav"),
-                        *(["-vf", "hflip,vflip"] if a.flip else []),
+                        *video_filter(a, m.get("color") == "sensor"),
                         "-fps_mode", "cfr", "-r", "24", "-c:v", "libx264", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-ar", "48000", str(out)], check=True)
         print(f"\nwrote {out}")

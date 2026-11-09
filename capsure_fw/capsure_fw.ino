@@ -70,17 +70,42 @@
 // What counts as a green pixel, in HSV. Keep the hue range symmetric around 120
 // (pure green) and inside 60-180, so it only matches pixels where green is the
 // largest channel, and the result does not depend on the decoder's R/B order.
-#define GREEN_HUE_MIN      75          // degrees; teal-ish greens up to yellow-ish greens
-#define GREEN_HUE_MAX      165
-#define GREEN_SAT_MIN_PCT  30          // rejects grey/white/skin tones with a faint green tint
-#define GREEN_VAL_MIN      40          // 0-255; rejects near-black pixels, whose hue is noise
+#define GREEN_HUE_MIN      58          // degrees (tuned 11/9 on the color-tuning page); green must
+#define GREEN_HUE_MAX      167         //   also be the largest channel, so the effective floor is 60
+#define GREEN_SAT_MIN_PCT  16          // rejects grey/white/skin tones with a faint green tint
+#define GREEN_VAL_MIN      42          // 0-255; rejects near-black pixels, whose hue is noise
+
+// ---- color correction (tuned 11/9; same math as the color-tuning page and caps2mp4.py) ----
+// The OV2640's output has its blacks lifted to ~25-30%, which greys everything
+// out. The detector corrects its 80x60 frame with these before the green test,
+// so the thresholds above mean the same thing as on the page.
+// SENSOR_COLOR 1: the OV2640's own processor corrects color before JPEG
+// compression, so recorded frames, the detector, the app and the MP4s all start
+// from corrected color. Its controls are coarse (-2..2); tune them live with
+// GET /admin/camera?brightness=..&contrast=..&saturation=..&ae=.. and copy the
+// values here. SENSOR_COLOR 0: raw sensor output, corrected in software by the
+// detector (CC_* below) and by caps2mp4.py.
+#define SENSOR_COLOR       1
+#define CAM_BRIGHTNESS     -2          // pulls the lifted blacks down
+#define CAM_CONTRAST       2
+#define CAM_SATURATION     2
+#define CAM_AE_LEVEL       0
+#define CAM_GAINCEILING    GAINCEILING_8X   // less noise/grey in dim areas
+#define CC_EV              0.05f       // exposure, stops
+#define CC_TEMP            0.15f       // + warmer
+#define CC_TINT            0.20f       // + magenta (frames lean green)
+#define CC_BLACK           0.23f       // black point
+#define CC_WHITE           0.99f       // white point
+#define CC_CONTRAST        1.10f
+#define CC_GAMMA           1.15f       // > 1 lifts midtones
+#define CC_SAT             1.55f
 #define WRITER_CORE   1                // was 0 in sdwriteandviewtest
 #define SD_MAX_FILES  10               // open files at once (default 5). Each slot costs ~4 KB of internal RAM:
                                        // recorder 1 + download workers 4 + indexing/thumb/ack/sum 2-3
 
 #define TARGET_FPS    24               // design choice; the sensor free-runs at ~60 at VGA
 #define CAM_VFLIP     1                // camera is mounted upside down
-#define CAM_HMIRROR   1
+#define CAM_HMIRROR   0                // 0: frames were mirrored with 1 (text read backwards)
 #define CLIP_W        640
 #define CLIP_H        480
 #define AUDIO_RATE    16000
@@ -124,6 +149,10 @@ volatile uint32_t greenPermille = 0;    // last check, tenths of a percent
 volatile uint32_t detectMs = 0, detectChecks = 0;
 volatile bool detVerbose = false;
 volatile bool detEnabled = true;          // 'd' on serial toggles it
+// Live camera tuning (/admin/camera). sensorColor decides whether the detector
+// still corrects in software and what the clip manifest records.
+volatile bool sensorColor = SENSOR_COLOR;
+int camBrightness = CAM_BRIGHTNESS, camContrast = CAM_CONTRAST, camSaturation = CAM_SATURATION, camAe = CAM_AE_LEVEL;
 // Footage is only kept while the table is in view. Starts off: nothing is
 // recorded until the first green frame.
 volatile bool recordingActive = !TABLE_GATES_RECORDING;
@@ -298,6 +327,29 @@ uint8_t *det565 = nullptr;
 #define DET_W (CLIP_W / 8)
 #define DET_H (CLIP_H / 8)
 
+// Exposure + white balance, then levels, then contrast/gamma on luma and
+// saturation on chroma. Matches the page and the ffmpeg chain in caps2mp4.py.
+static float ccLut[1024];
+void ccInit() {
+  for (int i = 0; i < 1024; i++) {
+    float y = (i / 1023.0f - 0.5f) * CC_CONTRAST + 0.5f;
+    ccLut[i] = powf(y < 0 ? 0 : y > 1 ? 1 : y, 1.0f / CC_GAMMA);
+  }
+}
+static inline uint8_t cc8(float v) { v *= 255.0f; return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)(v + 0.5f); }
+static inline void colorCorrect(uint8_t &r8, uint8_t &g8, uint8_t &b8) {
+  static const float g = powf(2.0f, CC_EV);
+  static const float gr = g * (1 + 0.1f * CC_TEMP), gg = g * (1 - 0.1f * CC_TINT), gb = g * (1 - 0.1f * CC_TEMP);
+  static const float span = CC_WHITE - CC_BLACK;
+  auto lv = [](float v) { v = (v > 1 ? 1 : v) - CC_BLACK; v /= span; return v < 0 ? 0.0f : v > 1 ? 1.0f : v; };
+  float r = lv(r8 / 255.0f * gr), gn = lv(g8 / 255.0f * gg), b = lv(b8 / 255.0f * gb);
+  float Y = 0.299f * r + 0.587f * gn + 0.114f * b;
+  float U = (b - Y) * CC_SAT, V = (r - Y) * CC_SAT;
+  float Y2 = ccLut[(int)(Y * 1023.0f + 0.5f)];
+  float R = Y2 + V, B = Y2 + U, G = (Y2 - 0.299f * R - 0.114f * B) / 0.587f;
+  r8 = cc8(R); g8 = cc8(G); b8 = cc8(B);
+}
+
 static inline void unpack565(const uint8_t *p, uint8_t &r, uint8_t &g, uint8_t &b) {
   uint16_t v = rgb565HighByteFirst ? (uint16_t)(p[0] << 8 | p[1]) : (uint16_t)(p[1] << 8 | p[0]);
   uint8_t r5 = v >> 11, g6 = (v >> 5) & 0x3F, b5 = v & 0x1F;
@@ -353,6 +405,7 @@ void detectTask(void *) {
       uint8_t r, g, b;
       for (int i = 0; i < DET_W * DET_H; i++) {
         unpack565(det565 + 2 * i, r, g, b);
+        if (!sensorColor) colorCorrect(r, g, b);             // sensor already did it otherwise
         if (isGreen(r, g, b)) c.green++;
         c.total++;
       }
@@ -414,24 +467,29 @@ void openSeg(int64_t ts) {
   segOpen = true;
 }
 
+// The clip's thumbnail is the frame closest to the button press: that is the
+// shot the player wanted to keep, and it's what the gallery shows before the
+// clip is downloaded. Uses each segment's .idx table (newest segment first).
 void writeThumb(uint32_t clipId, int64_t S, int64_t T) {
-  for (auto &s : segs) {
-    if (s.lastTs < S || s.firstTs > T) continue;
-    File f = SD.open(segPath(s.id));
-    if (!f) continue;
-    f.seek(sizeof(SegHdr));
-    PktHdr h;
-    while (f.read((uint8_t *)&h, sizeof h) == sizeof h) {
-      if (h.type == PKT_JPEG && h.ts >= S) {
-        uint8_t *b = (uint8_t *)ps_malloc(h.len);
-        if (b && f.read(b, h.len) == h.len) {
-          File o = SD.open(clipPath(clipId, "jpg"), FILE_WRITE); o.write(b, h.len); o.close();
-        }
-        free(b); f.close(); return;
-      }
-      f.seek(f.position() + h.len);
+  for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+    if (it->lastTs < S || it->firstTs > T) continue;
+    File ix = SD.open(idxPath(it->id));
+    if (!ix) continue;
+    size_t n = ix.size() / sizeof(SegPkt);
+    SegPkt e, best = {};
+    bool found = false;
+    for (size_t k = 0; k < n && ix.read((uint8_t *)&e, sizeof e) == sizeof e; k++)
+      if (e.type == PKT_JPEG && e.ts >= S && e.ts <= T) { best = e; found = true; }   // keep the latest
+    ix.close();
+    if (!found) continue;
+    File f = SD.open(segPath(it->id));
+    uint8_t *b = (uint8_t *)ps_malloc(best.len);
+    if (f && b && f.seek(best.off) && f.read(b, best.len) == best.len) {
+      File o = SD.open(clipPath(clipId, "jpg"), FILE_WRITE); o.write(b, best.len); o.close();
     }
-    f.close();
+    free(b);
+    if (f) f.close();
+    return;
   }
 }
 
@@ -451,9 +509,10 @@ void doSave(int64_t T) {
   uint32_t clipId = nextClipId++;
   String tmp = clipPath(clipId, "tmp");
   File m = SD.open(tmp, FILE_WRITE);
-  m.printf("{\n  \"clip\": %lu,\n  \"boot\": %lu,\n  \"table_detected\": %s,\n  \"green_pct\": %.1f,\n"
+  m.printf("{\n  \"clip\": %lu,\n  \"boot\": %lu,\n  \"color\": \"%s\",\n  \"table_detected\": %s,\n  \"green_pct\": %.1f,\n"
            "  \"unix_ms\": %lld,\n  \"press_us\": %lld,\n  \"start_us\": %lld,\n  \"end_us\": %lld,\n  \"segments\": [\n",
-           (unsigned long)clipId, (unsigned long)bootId, tableDetected ? "true" : "false", greenPermille / 10.0,
+           (unsigned long)clipId, (unsigned long)bootId, sensorColor ? "sensor" : "raw",
+           tableDetected ? "true" : "false", greenPermille / 10.0,
            (long long)(clockSet ? clockOffsetMs + T / 1000 : 0),
            (long long)T, (long long)S, (long long)T);
   bool first = true; uint32_t total = 0, n = 0;
@@ -1272,6 +1331,27 @@ static esp_err_t hBenchSd(httpd_req_t *req) {
   return sendJson(req, 200, xferJson(x));
 }
 
+// GET /admin/camera                       -> current settings
+// GET /admin/camera?contrast=2&brightness=-1&saturation=2&ae=0&sensor=1
+//   Changes take effect on the next frame; grab /api/preview to see them and
+//   /admin/table for the green %. Copy the values you like into CAM_* above.
+static esp_err_t hCamera(httpd_req_t *req) {
+  auto clampStep = [](int v) { return v < -2 ? -2 : v > 2 ? 2 : v; };
+  const int NONE = -99;
+  int v;
+  if ((v = queryInt(req, "brightness", NONE)) != NONE) camBrightness = clampStep(v);
+  if ((v = queryInt(req, "contrast", NONE)) != NONE) camContrast = clampStep(v);
+  if ((v = queryInt(req, "saturation", NONE)) != NONE) camSaturation = clampStep(v);
+  if ((v = queryInt(req, "ae", NONE)) != NONE) camAe = clampStep(v);
+  if ((v = queryInt(req, "sensor", NONE)) != NONE) sensorColor = v != 0;
+  applyCameraTuning();
+  char b[200];
+  snprintf(b, sizeof b, "{\"sensor\":%s,\"brightness\":%d,\"contrast\":%d,\"saturation\":%d,\"ae\":%d,"
+           "\"green_pct\":%.1f,\"table\":%s}", sensorColor ? "true" : "false", camBrightness, camContrast,
+           camSaturation, camAe, greenPermille / 10.0, tableDetected ? "true" : "false");
+  return sendJson(req, 200, String(b));
+}
+
 static esp_err_t hTable(httpd_req_t *req) {
   char b[200];
   snprintf(b, sizeof b, "{\"detected\":%s,\"green_pct\":%.1f,\"decode_ms\":%lu,\"checks\":%lu,"
@@ -1345,6 +1425,7 @@ void startApi() {
   regUri("/admin/save", HTTP_POST, hSave);
   regUri("/admin/last", HTTP_GET, hLast);
   regUri("/admin/table", HTTP_GET, hTable);
+  regUri("/admin/camera", HTTP_GET, hCamera);
   regUri("/bench/sd", HTTP_GET, hBenchSd);
   Serial.println("httpd on :80");
 }
@@ -1568,6 +1649,24 @@ void safeShutdown() {
 
 bool wifiSwitchOn() { return !WIFI_SWITCH_ENABLED || digitalRead(WIFI_SW_PIN) == LOW; }
 
+// Push the color settings to the OV2640. With sensorColor off, everything
+// goes back to neutral and correction happens in software instead.
+void applyCameraTuning() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+  bool on = sensorColor;
+  s->set_brightness(s, on ? camBrightness : 0);
+  s->set_contrast(s, on ? camContrast : 0);
+  s->set_saturation(s, on ? camSaturation : 0);
+  s->set_ae_level(s, on ? camAe : 0);
+  s->set_gainceiling(s, on ? CAM_GAINCEILING : GAINCEILING_2X);
+  s->set_whitebal(s, 1); s->set_awb_gain(s, 1); s->set_wb_mode(s, 0);
+  s->set_raw_gma(s, 1); s->set_lenc(s, 1);
+  Serial.printf("camera color: %s (brightness %d, contrast %d, saturation %d, ae %d)\n",
+                on ? "corrected on the sensor" : "raw (software correction)",
+                camBrightness, camContrast, camSaturation, camAe);
+}
+
 void fail(const char *msg) { for (;;) { Serial.println(msg); delay(3000); } }
 
 void setup() {
@@ -1624,6 +1723,7 @@ void setup() {
   // set CAM_HMIRROR to 0.
   s->set_vflip(s, CAM_VFLIP);
   s->set_hmirror(s, CAM_HMIRROR);
+  applyCameraTuning();
 
   i2s.setPinsPdmRx(42, 41);
   if (!i2s.begin(I2S_MODE_PDM_RX, AUDIO_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) fail("I2S init FAILED");
@@ -1634,6 +1734,7 @@ void setup() {
   det565 = (uint8_t *)ps_malloc(DET_W * DET_H * 2);                   // 9.6 KB; CPU-only, PSRAM is fine
   detReady = xSemaphoreCreateBinary();
   calibrateDecoder();
+  ccInit();
   idxMux = xSemaphoreCreateMutex();
   cmdQ = xQueueCreate(4, sizeof(WCmd *));
   pktQ = xQueueCreate(1024, sizeof(Packet *));

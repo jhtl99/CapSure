@@ -16,8 +16,15 @@
 export const DEVICE_URL = 'http://192.168.4.1';
 export const MOCK_URL = 'http://localhost:8080';
 
-/** What the connect screen starts with. */
-export const DEFAULT_BASE_URL = MOCK_URL;
+/** What the connect screen starts with. The mock is under Developer options. */
+export const DEFAULT_BASE_URL = DEVICE_URL;
+
+/** Shown in the connect steps. Must match AP_SSID / AP_PASS in the firmware. */
+export const HAT_NETWORK = 'CapSure-1234';
+export const HAT_PASSWORD = 'capsure123';
+
+/** How often the connect screen looks for the hat on its own. */
+export const AUTO_CONNECT_MS = 3000;
 
 /** Requests to the device time out fast: it is on the same Wi-Fi, or it is gone. */
 export const REQUEST_TIMEOUT_MS = 5000;
