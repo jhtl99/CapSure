@@ -1,7 +1,6 @@
 /*
  * CapSure firmware: recorder + HTTP API (docs/api.md v1) + Wi-Fi benchmarks.
  *
- * Recording side is Ankita's sdwriteandviewtest, unchanged in behaviour:
  *   camera + PDM mic -> PSRAM queue -> 2 s CAPS1SEG segments on SD,
  *   button / 's' saves the last 60 s as a manifest that protects its segments.
  * New on the recording side:
