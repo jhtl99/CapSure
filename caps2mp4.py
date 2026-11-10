@@ -70,7 +70,7 @@ def main():
     # Shift everything after a jump back by (jump - one frame) so the pause is
     # cut out instead of showing up as a frozen frame (and silence).
     frames, audio, all_ok = [], [], True
-    prev, shift, gaps = None, 0, []
+    prev, shift, gaps, mixed = None, 0, [], 0
     for s in sorted(m["segments"], key=lambda s: s["id"]):
         pkts, ok, npk = read_segment(seg_dir / f"{s['id']:08d}.cap", s["crc"])
         all_ok &= ok
@@ -78,11 +78,20 @@ def main():
         for typ, ts, d in pkts:
             if not start <= ts <= end:                   # trim to the clip window
                 continue
+            # Older firmware could mix in segments from an earlier power-on, whose
+            # timestamps restarted from 0. A big backwards jump marks the switch;
+            # keep only the later session, the one the button press belongs to.
+            if prev is not None and ts < prev - 1_000_000:
+                mixed += 1
+                frames, audio, prev, shift, gaps = [], [], None, 0, []
             if prev is not None and ts - prev > GAP_US and not a.keep_gaps:
                 gaps.append(ts - prev)
                 shift += ts - prev - FRAME_US
             prev = ts if prev is None else max(prev, ts)
             (frames if typ == JPEG else audio).append((ts - shift, d))
+    if mixed:
+        print("WARNING: this clip mixed footage from an earlier power-on (older firmware); "
+              "kept only the session with the button press")
     if gaps:
         print(f"cut {len(gaps)} pause(s) totalling {sum(gaps) / 1e6:.1f} s "
               f"(longest {max(gaps) / 1e6:.1f} s)")

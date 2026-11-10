@@ -15,7 +15,10 @@ struct __attribute__((packed)) PktHdr { uint8_t type; uint8_t rsv[3]; int64_t ts
 struct __attribute__((packed)) SegHdr { char magic[8]; uint32_t version, segId; int64_t firstTs, lastTs; uint32_t crc, packets; }; // 40 B
 struct __attribute__((packed)) SegPkt { uint8_t type; uint8_t rsv[3]; int64_t ts; uint32_t off, len; };   // 20 B, one per packet in .idx
 struct Packet { PktHdr h; uint8_t data[]; };
-struct SegInfo { uint32_t id; int64_t firstTs, lastTs; uint32_t bytes, crc; uint16_t refs; };
+// old = recorded before this power-on. Its timestamps come from a timer that
+// restarted at 0 since, so they can't be compared with today's; old segments
+// only ever belong to the clips that already reference them.
+struct SegInfo { uint32_t id; int64_t firstTs, lastTs; uint32_t bytes, crc; uint16_t refs; bool old; };
 
 // HTTP -> writer commands (clip delete)
 struct WCmd { uint32_t clipId; SemaphoreHandle_t done; bool ok; };

@@ -34,6 +34,7 @@
 #include <esp_wifi.h>
 #include <esp_http_server.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <vector>
 #include <map>
 #include <memory>
@@ -42,7 +43,7 @@
 
 // ------------------------- configuration -------------------------
 #define SEG_US        2000000LL        // 2-s segments
-#define WINDOW_US     60000000LL       // clip length
+#define WINDOW_US     60000000LL       // a clip is whatever was recorded in the 60 s before the press
 #define GAP_US        500000LL         // a jump this big between packets is a pause (no table), not footage
 #define SAVE_MARGIN   200000LL         // wait until data past T+200 ms is written
 #define MAX_UNPROT    34               // rolling buffer: 34 x 2 s = 68 s
@@ -136,6 +137,11 @@ volatile bool clockSet = false;
 volatile int64_t clockOffsetMs = 0;    // unix_ms - esp_timer_get_time()/1000
 uint32_t bootId = 0;
 volatile bool bufferHealthy = true;
+volatile int ledFeedback = 0;            // blinks to show on the LED (1 = press seen, 3 = nothing saved)
+
+// The wall clock survives deep sleep ('x'): the ESP32's RTC keeps counting,
+// and this flag lives in RTC memory. It does not survive losing power.
+RTC_DATA_ATTR bool rtcClockSet = false;
 
 // safe shutdown ('x'): capture stops, writer drains and closes, then deep sleep
 volatile bool captureStop = false, writerStop = false, writerDone = false;
@@ -472,7 +478,7 @@ void openSeg(int64_t ts) {
 // clip is downloaded. Uses each segment's .idx table (newest segment first).
 void writeThumb(uint32_t clipId, int64_t S, int64_t T) {
   for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
-    if (it->lastTs < S || it->firstTs > T) continue;
+    if (it->old || it->lastTs < S || it->firstTs > T) continue;
     File ix = SD.open(idxPath(it->id));
     if (!ix) continue;
     size_t n = ix.size() / sizeof(SegPkt);
@@ -494,17 +500,17 @@ void writeThumb(uint32_t clipId, int64_t S, int64_t T) {
 }
 
 void doSave(int64_t T) {
-  // The clip is the last 60 s of *recorded* footage. Recording pauses while the
-  // table is out of view, so walk back through the segments until they add up
-  // to 60 s instead of taking the last 60 s of wall-clock time.
-  int64_t S = T - WINDOW_US, have = 0;
-  for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
-    if (it->firstTs > T) continue;
-    int64_t segEnd = min(it->lastTs, T);
-    int64_t len = segEnd - it->firstTs;
-    if (have + len >= WINDOW_US) { S = segEnd - (WINDOW_US - have); have = WINDOW_US; break; }
-    have += len;
-    S = it->firstTs;
+  // The clip is whatever was recorded in the 60 s before the press, from this
+  // power-on only. Pauses (table out of view) inside that minute are cut out
+  // later, so the clip can be shorter:
+  //   - pressed 20 s after power-on       -> 20 s clip
+  //   - table in view 30 s of the last 60  -> 30 s clip
+  //   - no table at all in the last 60 s   -> nothing saved, LED blinks 3 times
+  const int64_t S = T - WINDOW_US;
+  int64_t have = 0;                                          // footage actually in the window, for the log
+  for (auto &sg : segs) {
+    if (sg.old || sg.lastTs < S || sg.firstTs > T) continue;
+    have += min(sg.lastTs, T) - max(sg.firstTs, S);
   }
   uint32_t clipId = nextClipId++;
   String tmp = clipPath(clipId, "tmp");
@@ -517,7 +523,7 @@ void doSave(int64_t T) {
            (long long)T, (long long)S, (long long)T);
   bool first = true; uint32_t total = 0, n = 0;
   for (auto &s : segs) {
-    if (s.lastTs < S || s.firstTs > T) continue;
+    if (s.old || s.lastTs < S || s.firstTs > T) continue;
     s.refs++;
     uint32_t fileBytes = s.bytes + sizeof(SegHdr);
     total += fileBytes; n++;
@@ -530,7 +536,8 @@ void doSave(int64_t T) {
   if (!n) {
     SD.remove(tmp);
     nextClipId--;
-    Serial.println(">>> Nothing saved: no table footage in the last 60 s");
+    Serial.println(">>> Nothing saved: nothing was recorded in the last 60 s");
+    ledFeedback = 3;                                         // three quick blinks: nothing to keep
     return;
   }
   writeThumb(clipId, S, T);
@@ -686,7 +693,7 @@ void recoverCard() {
     if (!refs) { toDelete.push_back(String(f.path())); continue; }
     SegHdr h;
     if (f.read((uint8_t *)&h, sizeof h) != sizeof h) continue;
-    segs.push_back({id, h.firstTs, h.lastTs, (uint32_t)(f.size() - sizeof(SegHdr)), h.crc, refs});
+    segs.push_back({id, h.firstTs, h.lastTs, (uint32_t)(f.size() - sizeof(SegHdr)), h.crc, refs, true});
   }
   File idd = SD.open("/caps/idx");
   for (File f = idd.openNextFile(); f; f = idd.openNextFile()) {
@@ -1060,6 +1067,9 @@ static esp_err_t hTime(httpd_req_t *req) {
   if (unixMs <= 0) return sendErr(req, 400, "bad_request", "unix_ms must be positive");
   clockOffsetMs = unixMs - esp_timer_get_time() / 1000;
   clockSet = true;
+  struct timeval tv = { (time_t)(unixMs / 1000), (suseconds_t)((unixMs % 1000) * 1000) };
+  settimeofday(&tv, nullptr);
+  rtcClockSet = true;
   Serial.printf("clock set: %lld\n", unixMs);
   return sendJson(req, 200, statusJson());
 }
@@ -1677,6 +1687,17 @@ void setup() {
   // SHUTDOWN_PIN / PWR_HOLD_PIN: reserved, intentionally not configured yet
   crcInit();
   bootId = esp_random();
+  // Waking from deep sleep: the RTC kept time, so the clock is still right.
+  if (rtcClockSet && esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    int64_t nowMs = (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    if (nowMs > 1700000000000LL) {
+      clockOffsetMs = nowMs - esp_timer_get_time() / 1000;
+      clockSet = true;
+      Serial.println("clock kept through deep sleep");
+    }
+  }
 
   SPI.begin(7, 8, 9, 21);
   // A card interrupted mid-write (e.g. by a re-upload) can refuse the first try,
@@ -1765,7 +1786,7 @@ void loop() {
     // Still LOW when we look (<= 10 ms later): a real press, not a spike on a breadboard wire.
     // The 500 ms lockout swallows contact bounce.
     bool still = digitalRead(SAVE_PIN) == LOW, locked = btnT - lastBtn <= 500000;
-    if (still && !locked) { lastBtn = btnT; requestSave(btnT); }
+    if (still && !locked) { lastBtn = btnT; requestSave(btnT); ledFeedback = 1; }
     else if (btnDebug) Serial.printf("button: interrupt ignored (%s)\n",
                                      !still ? "pin was already HIGH again: noise or a very short tap" : "within 500 ms of the last press");
   }
@@ -1778,6 +1799,17 @@ void loop() {
       lastLevel = level; lastIrqs = btnIrqs;
     }
   }
+  // LED blinks without blocking: each blink flips the LED away from its
+  // normal state (on = recording, off = paused) for 120 ms and back.
+  static int blinkLeft = 0; static uint32_t blinkAt = 0;
+  if (ledFeedback) { blinkLeft += 2 * ledFeedback; ledFeedback = 0; }
+  if (blinkLeft > 0 && (int32_t)(millis() - blinkAt) >= 0) {
+    blinkLeft--;
+    bool base = recordingActive;
+    digitalWrite(LED_PIN, (blinkLeft % 2) ? !base : base);
+    blinkAt = millis() + 120;
+  }
+
   while (Serial.available()) {
     char ch = Serial.read();
     if (ch == 'x') safeShutdown();                           // does not return
