@@ -5,6 +5,9 @@ Usage: python3 caps2mp4.py /Volumes/<SD>/caps/clips/clip_0001.json [out.mp4] [--
   --flip       rotate 180 degrees (clips recorded before the firmware flipped the sensor)
   --keep-gaps  keep pauses (table out of view) as frozen frames instead of cutting them
   --raw        skip the color correction (lifted blacks, low saturation straight off the sensor)
+  --force      convert again even if the MP4 already exists
+An MP4 that already exists and is newer than its clip is skipped, so converting
+a whole card again only does the new clips.
 Requires ffmpeg on PATH (macOS: brew install ffmpeg).
 """
 import argparse, json, shutil, statistics, struct, subprocess, sys, tempfile, wave, zlib
@@ -26,19 +29,40 @@ COLOR_FILTER = ("colorchannelmixer=rr=1.0508:gg=1.0146:bb=1.0197,"
 
 
 def read_segment(path, expected_crc):
+    """Packets of one segment, whether it closed cleanly or not.
+
+    The firmware writes a blank header when a segment opens and the real one
+    when it closes. If power or the card went away in between, the header is
+    blank (or damaged) but the packets after it are still good: each one says
+    its own type, time and length. So read them anyway, stop at the first one
+    that doesn't make sense, and report it instead of giving up on the clip.
+    """
+    if not path.exists():
+        print(f"  {path.name}: MISSING, skipped")
+        return [], False, 0
     data = path.read_bytes()
+    if len(data) < SEG_HDR.size:
+        print(f"  {path.name}: only {len(data)} bytes, skipped")
+        return [], False, 0
     magic, _ver, _id, _first, _last, crc, npk = SEG_HDR.unpack_from(data, 0)
-    if magic != b"CAPS1SEG":
-        raise ValueError(f"{path.name}: not a CAPS1 segment")
+    clean = magic == b"CAPS1SEG"
+    if not clean:
+        blank = data[:SEG_HDR.size] == bytes(SEG_HDR.size)
+        print(f"  {path.name}: header {'never finalized (blank)' if blank else 'damaged'}; "
+              "recovering its packets anyway")
     body = data[SEG_HDR.size:]
-    ok = zlib.crc32(body) == crc == expected_crc
+    ok = clean and zlib.crc32(body) == crc == expected_crc
     pkts, off = [], 0
     while off + PKT_HDR.size <= len(body):
         typ, ts, n = PKT_HDR.unpack_from(body, off)
+        if typ not in (JPEG, PCM) or n == 0 or off + PKT_HDR.size + n > len(body):
+            if clean and off + PKT_HDR.size <= len(body):
+                print(f"  {path.name}: stopped at a bad packet at byte {off + SEG_HDR.size}")
+            break
         off += PKT_HDR.size
         pkts.append((typ, ts, body[off:off + n]))
         off += n
-    return pkts, ok, npk
+    return pkts, ok, npk if clean else len(pkts)
 
 
 def video_filter(a, sensor_corrected):
@@ -56,11 +80,18 @@ def main():
     ap.add_argument("--flip", action="store_true")
     ap.add_argument("--keep-gaps", action="store_true")
     ap.add_argument("--raw", action="store_true")
+    ap.add_argument("--force", action="store_true")
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     a = ap.parse_args()
     manifest = Path(a.manifest)
     out = Path(a.out) if a.out else manifest.with_suffix(".mp4")
+    # Already converted? The MP4 is only ever written complete (see below), so
+    # one that exists and is newer than the clip's manifest is up to date.
+    if not a.force and out.exists() and out.stat().st_size > 0 \
+            and out.stat().st_mtime >= manifest.stat().st_mtime:
+        print(f"{out.name}: already converted, skipped (--force to redo)")
+        return
     m = json.loads(manifest.read_text())
     seg_dir = manifest.parent.parent / "seg"
     start, end = m["start_us"], m["end_us"]
@@ -152,12 +183,16 @@ def main():
         with wave.open(str(tmp / "audio.wav"), "wb") as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(bytes(pcm))
 
+        # Write next to the target under a temporary name, so an interrupted run
+        # never leaves a half-written MP4 that a later run would skip.
+        partial = out.with_name(out.stem + ".partial.mp4")
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error",
                         "-f", "concat", "-safe", "0", "-i", str(tmp / "frames.txt"),
                         "-i", str(tmp / "audio.wav"),
                         *video_filter(a, m.get("color") == "sensor"),
                         "-fps_mode", "cfr", "-r", "24", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                        "-c:a", "aac", "-ar", "48000", str(out)], check=True)
+                        "-c:a", "aac", "-ar", "48000", str(partial)], check=True)
+        partial.replace(out)        # only a finished file gets the real name
         print(f"\nwrote {out}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

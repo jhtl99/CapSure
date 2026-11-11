@@ -357,7 +357,8 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', gap: space.sm + 4 },
   tile: { flex: 1, gap: 6 },
   tileSpacer: { flex: 1 },
-  thumb: { width: '100%', aspectRatio: 4 / 3, borderRadius: radius.md },
+  // 16:9 to match the hat's 1280x720 recordings; older 640x480 thumbnails are cropped slightly.
+  thumb: { width: '100%', aspectRatio: 16 / 9, borderRadius: radius.md },
   timeChip: {
     position: 'absolute',
     left: 6,

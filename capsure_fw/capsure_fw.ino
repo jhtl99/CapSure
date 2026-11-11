@@ -40,6 +40,7 @@
 #include <memory>
 #include <algorithm>
 #include "capsure_types.h"
+#include "live_page.h"
 
 // ------------------------- configuration -------------------------
 #define SEG_US        2000000LL        // 2-s segments
@@ -76,6 +77,15 @@
 #define GREEN_SAT_MIN_PCT  16          // rejects grey/white/skin tones with a faint green tint
 #define GREEN_VAL_MIN      42          // 0-255; rejects near-black pixels, whose hue is noise
 
+// Blue cloth counts too: our table is a cyan-blue (measured hue ~200, 84% sat
+// in a phone photo). The camera shows it less saturated and can shift the hue
+// a little, hence the band. The 35% floor keeps out denim and grey-blue shadows.
+#define TABLE_BLUE         1           // 0 = green cloth only
+#define BLUE_HUE_MIN       165         // degrees; 180 = cyan, 240 = pure blue. The OV2640 renders our
+#define BLUE_HUE_MAX       225         //   cyan felt as teal (~172) in warm, dim light, so start below cyan
+#define BLUE_SAT_MIN_PCT   25
+#define BLUE_VAL_MIN       42
+
 // ---- color correction (tuned 11/9; same math as the color-tuning page and caps2mp4.py) ----
 // The OV2640's output has its blacks lifted to ~25-30%, which greys everything
 // out. The detector corrects its 80x60 frame with these before the green test,
@@ -87,11 +97,19 @@
 // values here. SENSOR_COLOR 0: raw sensor output, corrected in software by the
 // detector (CC_* below) and by caps2mp4.py.
 #define SENSOR_COLOR       1
-#define CAM_BRIGHTNESS     -2          // pulls the lifted blacks down
-#define CAM_CONTRAST       2
+// Tuned 11/10 in the pool room with /live (dim, warm overhead lights): the
+// table reads ~32% table colour. The earlier brightness -2 / gain cap 8x
+// crushed this room to near black.
+#define CAM_BRIGHTNESS     2           // -2..2; 2 is the sensor's maximum
+#define CAM_CONTRAST       1
 #define CAM_SATURATION     2
-#define CAM_AE_LEVEL       0
-#define CAM_GAINCEILING    GAINCEILING_8X   // less noise/grey in dim areas
+#define CAM_AE_LEVEL       2           // -2..2; 2 is the sensor's maximum
+#define CAM_GAIN_X         128         // gain ceiling: 2, 4, 8, 16, 32, 64 or 128 (more = brighter + noisier)
+// Sensor clock. At 20 MHz the OV2640 runs ~60 fps at VGA, so each frame can
+// gather light for at most ~16 ms, and we only keep 24 of them anyway. 10 MHz
+// runs it at ~30 fps: twice the light per frame without extra gain (noise),
+// still above our 24 fps, and half the work for the camera driver.
+#define CAM_XCLK_HZ        10000000
 #define CC_EV              0.05f       // exposure, stops
 #define CC_TEMP            0.15f       // + warmer
 #define CC_TINT            0.20f       // + magenta (frames lean green)
@@ -107,8 +125,12 @@
 #define TARGET_FPS    24               // design choice; the sensor free-runs at ~60 at VGA
 #define CAM_VFLIP     1                // camera is mounted upside down
 #define CAM_HMIRROR   0                // 0: frames were mirrored with 1 (text read backwards)
-#define CLIP_W        640
-#define CLIP_H        480
+// Recording resolution. OV3660 on our board (max 2048x1536). 1280x720 JPEGs
+// are ~3x the size of 640x480 ones (~1.7 MB/s at 24 fps): fine for the SD
+// card, slower to transfer. Keep CLIP_W/CLIP_H in step with CAM_FRAMESIZE.
+#define CAM_FRAMESIZE FRAMESIZE_HD     // FRAMESIZE_VGA = 640x480, FRAMESIZE_SVGA = 800x600, FRAMESIZE_HD = 1280x720
+#define CLIP_W        1280
+#define CLIP_H        720
 #define AUDIO_RATE    16000
 
 const char *AP_SSID = "CapSure-1234";
@@ -124,6 +146,7 @@ I2SClass i2s;
 QueueHandle_t pktQ;
 portMUX_TYPE qMux = portMUX_INITIALIZER_UNLOCKED, saveMux = portMUX_INITIALIZER_UNLOCKED;
 volatile size_t queuedBytes = 0, peakQueued = 0;
+volatile uint32_t sensorFrames = 0;      // every frame the camera delivered, kept or not
 volatile uint32_t dropped = 0, framesCaptured = 0, audioBlocks = 0, worstWrite = 0, writeErrors = 0;
 volatile int unprotCount = 0;
 volatile bool listReq = false;
@@ -159,6 +182,7 @@ volatile bool detEnabled = true;          // 'd' on serial toggles it
 // still corrects in software and what the clip manifest records.
 volatile bool sensorColor = SENSOR_COLOR;
 int camBrightness = CAM_BRIGHTNESS, camContrast = CAM_CONTRAST, camSaturation = CAM_SATURATION, camAe = CAM_AE_LEVEL;
+int camGainX = CAM_GAIN_X;
 // Footage is only kept while the table is in view. Starts off: nothing is
 // recorded until the first green frame.
 volatile bool recordingActive = !TABLE_GATES_RECORDING;
@@ -244,6 +268,7 @@ void cameraTask(void *) {
     if (captureStop) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) continue;
+    sensorFrames++;
     int64_t now = esp_timer_get_time();
     int64_t ts = (int64_t)fb->timestamp.tv_sec * 1000000LL + fb->timestamp.tv_usec;
     if (ts <= 0 || ts > now || now - ts > 500000) ts = now;
@@ -317,13 +342,24 @@ void audioTask(void *) {
 // ------------------------- table detection -------------------------
 // Integer HSV test. Only pixels whose largest channel is green can have a hue
 // in 60-180, so check that first; then hue = 120 + 60 * (b - r) / (max - min).
-static inline bool isGreen(uint8_t r, uint8_t g, uint8_t b) {
-  if (g < r || g < b) return false;
-  int mx = g, mn = r < b ? r : b, d = mx - mn;
-  if (mx < GREEN_VAL_MIN || d == 0) return false;
-  if (d * 100 < GREEN_SAT_MIN_PCT * mx) return false;              // saturation
-  int hx = 60 * ((int)b - (int)r);                                   // (hue - 120) * d
-  return hx >= (GREEN_HUE_MIN - 120) * d && hx <= (GREEN_HUE_MAX - 120) * d;
+// Does this pixel look like table cloth? Green (GREEN_*) or, with TABLE_BLUE,
+// blue (BLUE_*). Hue, saturation and brightness as in HSV.
+static inline bool isTableColor(uint8_t r, uint8_t g, uint8_t b) {
+  int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+  int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+  int d = mx - mn;
+  if (d == 0) return false;
+  float h;                                                           // 0..360
+  if (mx == r)      h = 60.0f * ((int)g - (int)b) / d;
+  else if (mx == g) h = 60.0f * ((int)b - (int)r) / d + 120.0f;
+  else              h = 60.0f * ((int)r - (int)g) / d + 240.0f;
+  if (h < 0) h += 360.0f;
+  int satPct = d * 100 / mx;
+  if (mx >= GREEN_VAL_MIN && satPct >= GREEN_SAT_MIN_PCT && h >= GREEN_HUE_MIN && h <= GREEN_HUE_MAX)
+    return true;
+  if (TABLE_BLUE && mx >= BLUE_VAL_MIN && satPct >= BLUE_SAT_MIN_PCT && h >= BLUE_HUE_MIN && h <= BLUE_HUE_MAX)
+    return true;
+  return false;
 }
 
 // jpg2rgb565 output byte order differs between esp32-camera versions;
@@ -412,7 +448,7 @@ void detectTask(void *) {
       for (int i = 0; i < DET_W * DET_H; i++) {
         unpack565(det565 + 2 * i, r, g, b);
         if (!sensorColor) colorCorrect(r, g, b);             // sensor already did it otherwise
-        if (isGreen(r, g, b)) c.green++;
+        if (isTableColor(r, g, b)) c.green++;            // 'green' = table cloth, green or blue
         c.total++;
       }
     }
@@ -1349,17 +1385,33 @@ static esp_err_t hCamera(httpd_req_t *req) {
   auto clampStep = [](int v) { return v < -2 ? -2 : v > 2 ? 2 : v; };
   const int NONE = -99;
   int v;
-  if ((v = queryInt(req, "brightness", NONE)) != NONE) camBrightness = clampStep(v);
-  if ((v = queryInt(req, "contrast", NONE)) != NONE) camContrast = clampStep(v);
-  if ((v = queryInt(req, "saturation", NONE)) != NONE) camSaturation = clampStep(v);
-  if ((v = queryInt(req, "ae", NONE)) != NONE) camAe = clampStep(v);
-  if ((v = queryInt(req, "sensor", NONE)) != NONE) sensorColor = v != 0;
-  applyCameraTuning();
-  char b[200];
+  bool changed = false;
+  if ((v = queryInt(req, "brightness", NONE)) != NONE) { camBrightness = clampStep(v); changed = true; }
+  if ((v = queryInt(req, "contrast", NONE)) != NONE) { camContrast = clampStep(v); changed = true; }
+  if ((v = queryInt(req, "saturation", NONE)) != NONE) { camSaturation = clampStep(v); changed = true; }
+  if ((v = queryInt(req, "ae", NONE)) != NONE) { camAe = clampStep(v); changed = true; }
+  if ((v = queryInt(req, "gain", NONE)) != NONE) {
+    int g = 2; while (g < 128 && g < v) g <<= 1;            // the sensor only has 2x, 4x ... 128x
+    camGainX = g; changed = true;
+  }
+  if ((v = queryInt(req, "sensor", NONE)) != NONE) { sensorColor = v != 0; changed = true; }
+  if (changed) applyCameraTuning();
+  char b[260];
   snprintf(b, sizeof b, "{\"sensor\":%s,\"brightness\":%d,\"contrast\":%d,\"saturation\":%d,\"ae\":%d,"
-           "\"green_pct\":%.1f,\"table\":%s}", sensorColor ? "true" : "false", camBrightness, camContrast,
-           camSaturation, camAe, greenPermille / 10.0, tableDetected ? "true" : "false");
+           "\"gain\":%d,\"green_pct\":%.1f,\"table\":%s,\"recording\":%s}", sensorColor ? "true" : "false",
+           camBrightness, camContrast, camSaturation, camAe, camGainX, greenPermille / 10.0,
+           tableDetected ? "true" : "false", recordingActive ? "true" : "false");
   return sendJson(req, 200, String(b));
+}
+
+// GET /live : a page that shows what the camera sees (~5 frames/s from
+// /api/preview), whether it counts as the table, and sliders for the sensor
+// settings. Open it in a phone or laptop browser on the CapSure network.
+// LIVE_HTML lives in live_page.h: the Arduino IDE's prototype scanner can trip over raw strings in an .ino.
+
+static esp_err_t hLive(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, LIVE_HTML, sizeof(LIVE_HTML) - 1);
 }
 
 static esp_err_t hTable(httpd_req_t *req) {
@@ -1406,7 +1458,7 @@ void startApi() {
   cfg.ctrl_port = 32768;
   cfg.core_id = 0;                                          // radio core
   cfg.stack_size = 8192;
-  cfg.max_uri_handlers = 20;
+  cfg.max_uri_handlers = 24;
   cfg.lru_purge_enable = true;
   cfg.send_wait_timeout = 10;
   cfg.recv_wait_timeout = 10;
@@ -1436,6 +1488,7 @@ void startApi() {
   regUri("/admin/last", HTTP_GET, hLast);
   regUri("/admin/table", HTTP_GET, hTable);
   regUri("/admin/camera", HTTP_GET, hCamera);
+  regUri("/live", HTTP_GET, hLive);
   regUri("/bench/sd", HTTP_GET, hBenchSd);
   Serial.println("httpd on :80");
 }
@@ -1669,12 +1722,14 @@ void applyCameraTuning() {
   s->set_contrast(s, on ? camContrast : 0);
   s->set_saturation(s, on ? camSaturation : 0);
   s->set_ae_level(s, on ? camAe : 0);
-  s->set_gainceiling(s, on ? CAM_GAINCEILING : GAINCEILING_2X);
+  // gainceiling_t: 0 = 2x, 1 = 4x ... 6 = 128x
+  int gi = 0; while (gi < 6 && (2 << gi) < camGainX) gi++;
+  s->set_gainceiling(s, (gainceiling_t)(on ? gi : 2));
   s->set_whitebal(s, 1); s->set_awb_gain(s, 1); s->set_wb_mode(s, 0);
   s->set_raw_gma(s, 1); s->set_lenc(s, 1);
-  Serial.printf("camera color: %s (brightness %d, contrast %d, saturation %d, ae %d)\n",
+  Serial.printf("camera color: %s (brightness %d, contrast %d, saturation %d, ae %d, gain cap %dx)\n",
                 on ? "corrected on the sensor" : "raw (software correction)",
-                camBrightness, camContrast, camSaturation, camAe);
+                camBrightness, camContrast, camSaturation, camAe, 2 << gi);
 }
 
 void fail(const char *msg) { for (;;) { Serial.println(msg); delay(3000); } }
@@ -1729,16 +1784,17 @@ void setup() {
   c.pin_d7 = 48; c.pin_d6 = 11; c.pin_d5 = 12; c.pin_d4 = 14;
   c.pin_d3 = 16; c.pin_d2 = 18; c.pin_d1 = 17; c.pin_d0 = 15;
   c.pin_vsync = 38; c.pin_href = 47; c.pin_pclk = 13;
-  c.xclk_freq_hz = 20000000;
+  c.xclk_freq_hz = CAM_XCLK_HZ;
   c.ledc_timer = LEDC_TIMER_0; c.ledc_channel = LEDC_CHANNEL_0;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.frame_size = FRAMESIZE_XGA;
+  c.frame_size = CAM_FRAMESIZE;         // frame buffers sized for this resolution
   c.jpeg_quality = 12; c.fb_count = 3;
   c.fb_location = CAMERA_FB_IN_PSRAM; c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   if (esp_camera_init(&c) != ESP_OK) fail("Camera init FAILED");
   Serial.printf("[heap] after camera init: %u internal free\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   sensor_t *s = esp_camera_sensor_get();
-  s->set_framesize(s, FRAMESIZE_VGA);
+  s->set_framesize(s, CAM_FRAMESIZE);
+  Serial.printf("camera sensor PID 0x%x, recording %dx%d\n", s->id.PID, CLIP_W, CLIP_H);
   // Mounted upside down: rotate 180 degrees on the sensor (free; also fixes
   // preview, thumbnails and the detector). If text looks mirrored afterwards,
   // set CAM_HMIRROR to 0.
@@ -1845,14 +1901,17 @@ void loop() {
   static uint32_t dropHist[12] = {0}; static int hi = 0;
   static uint32_t lastPrint = 0, lastF = 0, lastA = 0, lastStorage = 0;
   if (millis() - lastPrint >= 5000) {
-    uint32_t f = framesCaptured, a = audioBlocks, d = dropped;
+    uint32_t f = framesCaptured, a = audioBlocks, d = dropped, sf = sensorFrames;
+    static uint32_t lastSF = 0;
     bufferHealthy = (d == dropHist[hi]);
     dropHist[hi] = d; hi = (hi + 1) % 12;
-    Serial.printf("fps %.1f | audio %.0f blk/s | queue peak %u KB | dropped %lu | worst write %lu ms | rolling %d segs | errors %lu | table %s (green %.1f%%) | %s | wifi %s\n",
-                  (f - lastF) / 5.0, (a - lastA) / 5.0, (unsigned)(peakQueued / 1024),
+    // "sensor" is what the camera delivers; "fps" is what we keep (target 24).
+    // If sensor drops below ~26 at this resolution, raise CAM_XCLK_HZ.
+    Serial.printf("sensor %.1f fps | fps %.1f | audio %.0f blk/s | queue peak %u KB | dropped %lu | worst write %lu ms | rolling %d segs | errors %lu | table %s (green %.1f%%) | %s | wifi %s\n",
+                  (sf - lastSF) / 5.0, (f - lastF) / 5.0, (a - lastA) / 5.0, (unsigned)(peakQueued / 1024),
                   (unsigned long)d, (unsigned long)worstWrite, unprotCount, (unsigned long)writeErrors,
                   tableDetected ? "YES" : "no", greenPermille / 10.0, recordingActive ? "REC" : "paused", apOn ? "on" : "off");
-    lastF = f; lastA = a; lastPrint = millis(); worstWrite = 0;
+    lastF = f; lastA = a; lastSF = sf; lastPrint = millis(); worstWrite = 0;
   }
   if (millis() - lastStorage >= 30000) {                    // f_getfree can be slow; keep it off the hot paths
     storageFreeMb = (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024);

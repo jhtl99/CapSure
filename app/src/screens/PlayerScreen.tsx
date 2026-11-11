@@ -478,7 +478,11 @@ function CapPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
     <ScrollView contentContainerStyle={styles.container}>
       <TopBar meta={meta} onBack={onBack} />
 
-      <Pressable onPress={toggle} style={styles.stage} accessibilityLabel={playing ? 'Pause' : 'Play'}>
+      <Pressable
+        onPress={toggle}
+        style={[styles.stage, { aspectRatio: prepared.index.header.width / Math.max(1, prepared.index.header.height) }]}
+        accessibilityLabel={playing ? 'Pause' : 'Play'}
+      >
         {nFrames ? (
           <Image
             source={{ uri: prepared.frameUris[frame] }}
