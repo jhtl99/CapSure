@@ -105,11 +105,11 @@
 #define CAM_SATURATION     2
 #define CAM_AE_LEVEL       2           // -2..2; 2 is the sensor's maximum
 #define CAM_GAIN_X         128         // gain ceiling: 2, 4, 8, 16, 32, 64 or 128 (more = brighter + noisier)
-// Sensor clock. At 20 MHz the OV2640 runs ~60 fps at VGA, so each frame can
-// gather light for at most ~16 ms, and we only keep 24 of them anyway. 10 MHz
-// runs it at ~30 fps: twice the light per frame without extra gain (noise),
-// still above our 24 fps, and half the work for the camera driver.
-#define CAM_XCLK_HZ        10000000
+// Sensor clock. 10 MHz brightened 640x480 on the assumption of a ~60 fps
+// sensor, but at 1280x720 the OV3660 then only manages ~9 fps (measured 11/10).
+// 20 MHz is the full-speed clock. Check "sensor .. fps" in the status line:
+// it needs to stay above ~26 for us to keep 24.
+#define CAM_XCLK_HZ        20000000
 #define CC_EV              0.05f       // exposure, stops
 #define CC_TEMP            0.15f       // + warmer
 #define CC_TINT            0.20f       // + magenta (frames lean green)
@@ -1727,6 +1727,7 @@ void applyCameraTuning() {
   s->set_gainceiling(s, (gainceiling_t)(on ? gi : 2));
   s->set_whitebal(s, 1); s->set_awb_gain(s, 1); s->set_wb_mode(s, 0);
   s->set_raw_gma(s, 1); s->set_lenc(s, 1);
+  s->set_aec2(s, 0);                       // no night mode: it stretches frames in dim light and drops the fps
   Serial.printf("camera color: %s (brightness %d, contrast %d, saturation %d, ae %d, gain cap %dx)\n",
                 on ? "corrected on the sensor" : "raw (software correction)",
                 camBrightness, camContrast, camSaturation, camAe, 2 << gi);
