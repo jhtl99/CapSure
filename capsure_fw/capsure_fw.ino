@@ -111,13 +111,14 @@
 // it needs to stay above ~26 for us to keep 24.
 #define CAM_XCLK_HZ        20000000
 // Frame-rate controls. Tune them live on /live (Speed section), then copy the
-// block it prints here. 0 = keep the camera driver's own value.
-// OV5640 only, except CAM_JPEG_Q.
-#define CAM_PLL_MUL        0           // sensor PLL multiplier; driver: 200. Higher = faster sensor clock (more fps, more heat, may glitch)
+// block it prints here. 0 = keep the camera driver's own value. OV5640 only,
+// except CAM_JPEG_Q. Sweep 11/23 (pool room): 20 MHz, x240, HTS 2200 gave
+// 32.7 sensor fps, vs 14.6 with the driver's 2644-clock lines.
+#define CAM_PLL_MUL        240         // sensor PLL multiplier; driver: 200. Higher = faster sensor clock (more fps, more heat, may glitch)
 #define CAM_PCLK_DIV       0           // pixel-clock divider; driver: 4. Lower = faster output to the ESP
 #define CAM_MAX_EXP        0           // longest exposure, in sensor lines; driver: 984. A 1280x720 frame is 744 lines,
                                        // so above that the sensor stretches frames in dim light (fewer fps)
-#define CAM_HTS            0           // line length in sensor clocks; driver: 2644 at 1280x720. Shorter lines = shorter
+#define CAM_HTS            2200        // line length in sensor clocks; driver: 2644 at 1280x720. Shorter lines = shorter
                                        // frames = more fps at the same clock (Linux's OV5640 driver uses 1892 for 720p30)
 #define CAM_BAND           0           // flicker filter: 0 = driver (50 Hz), 60 = US mains lights, 50, -1 = off
 #define CAM_JPEG_Q         12          // JPEG quality 8..30: lower = sharper but bigger frames
