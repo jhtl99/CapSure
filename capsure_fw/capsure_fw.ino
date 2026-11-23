@@ -117,6 +117,8 @@
 #define CAM_PCLK_DIV       0           // pixel-clock divider; driver: 4. Lower = faster output to the ESP
 #define CAM_MAX_EXP        0           // longest exposure, in sensor lines; driver: 984. A 1280x720 frame is 744 lines,
                                        // so above that the sensor stretches frames in dim light (fewer fps)
+#define CAM_HTS            0           // line length in sensor clocks; driver: 2644 at 1280x720. Shorter lines = shorter
+                                       // frames = more fps at the same clock (Linux's OV5640 driver uses 1892 for 720p30)
 #define CAM_BAND           0           // flicker filter: 0 = driver (50 Hz), 60 = US mains lights, 50, -1 = off
 #define CAM_JPEG_Q         12          // JPEG quality 8..30: lower = sharper but bigger frames
 #define CC_EV              0.05f       // exposure, stops
@@ -194,6 +196,7 @@ int camBrightness = CAM_BRIGHTNESS, camContrast = CAM_CONTRAST, camSaturation = 
 int camGainX = CAM_GAIN_X;
 // frame-rate settings (see CAM_PLL_MUL above) and what they achieve
 int camXclkMhz = CAM_XCLK_HZ / 1000000, camPllMul = CAM_PLL_MUL, camPclkDiv = CAM_PCLK_DIV;
+int camHts = CAM_HTS;
 int camMaxExp = CAM_MAX_EXP, camBand = CAM_BAND, camJpegQ = CAM_JPEG_Q;
 bool isOV5640 = false;
 void applySpeed();
@@ -1444,6 +1447,7 @@ static esp_err_t hSpeed(httpd_req_t *req) {
   if ((v = queryInt(req, "xclk", NONE)) != NONE) { camXclkMhz = constrain(v, 6, 24); changed = true; }
   if ((v = queryInt(req, "mul", NONE)) != NONE) { camPllMul = v ? constrain(v, 100, 252) : 0; changed = true; }
   if ((v = queryInt(req, "pclk", NONE)) != NONE) { camPclkDiv = v ? constrain(v, 2, 16) : 0; changed = true; }
+  if ((v = queryInt(req, "hts", NONE)) != NONE) { camHts = v ? constrain(v, 1600, 3200) : 0; changed = true; }
   if ((v = queryInt(req, "maxexp", NONE)) != NONE) { camMaxExp = v ? constrain(v, 100, 4000) : 0; changed = true; }
   if ((v = queryInt(req, "band", NONE)) != NONE) { camBand = (v == 50 || v == 60 || v == -1) ? v : 0; changed = true; }
   if ((v = queryInt(req, "q", NONE)) != NONE) { camJpegQ = constrain(v, 8, 30); changed = true; }
@@ -1456,11 +1460,11 @@ static esp_err_t hSpeed(httpd_req_t *req) {
     expo = s->get_reg(s, 0x3500, 0xFFFFFF) >> 4;              // lines
     gain = s->get_reg(s, 0x350A, 0xFFFF) & 0x3FF;             // 16 = 1x
   }
-  char b[420];
-  snprintf(b, sizeof b, "{\"ov5640\":%s,\"pid\":%d,\"xclk\":%d,\"mul\":%d,\"pclk\":%d,\"maxexp\":%d,\"band\":%d,\"q\":%d,"
+  char b[512];
+  snprintf(b, sizeof b, "{\"ov5640\":%s,\"pid\":%d,\"xclk\":%d,\"mul\":%d,\"pclk\":%d,\"hts_set\":%d,\"maxexp\":%d,\"band\":%d,\"q\":%d,"
            "\"sensor_fps\":%.1f,\"rec_fps\":%.1f,\"frame_kb\":%.1f,\"luma\":%lu,\"hts\":%d,\"vts\":%d,\"exposure\":%d,"
            "\"gain_x\":%.1f,\"dropped\":%lu,\"recording\":%s,\"table\":%s}",
-           isOV5640 ? "true" : "false", s ? s->id.PID : 0, camXclkMhz, camPllMul, camPclkDiv, camMaxExp, camBand, camJpegQ,
+           isOV5640 ? "true" : "false", s ? s->id.PID : 0, camXclkMhz, camPllMul, camPclkDiv, camHts, camMaxExp, camBand, camJpegQ,
            rateSensorFps, rateRecFps, rateFrameKB, (unsigned long)detLuma, hts, vts, expo, gain / 16.0f,
            (unsigned long)dropped, recordingActive ? "true" : "false", tableDetected ? "true" : "false");
   return sendJson(req, 200, String(b));
@@ -1806,6 +1810,7 @@ void applySpeed() {
   if (isOV5640) {
     // Same call the driver makes for JPEG at 1280x720, with our multiplier and divider.
     s->set_pll(s, 0, camPllMul ? camPllMul : 200, 4, 0, 2, 2, 1, camPclkDiv ? camPclkDiv : 4);
+    s->set_reg(s, 0x380C, 0xFFFF, camHts ? camHts : 2644);    // line length (HTS)
     int me = camMaxExp ? camMaxExp : 984;
     s->set_reg(s, 0x3A02, 0xFFFF, me);                        // max exposure, 60 Hz mode
     s->set_reg(s, 0x3A14, 0xFFFF, me);                        // max exposure, 50 Hz mode
@@ -1815,8 +1820,8 @@ void applySpeed() {
       s->set_reg(s, 0x3C00, 0x04, camBand == 60 ? 0x00 : 0x04);   // bit 2: 50 Hz
     }
   }
-  Serial.printf("camera speed: xclk %d MHz, pll x%d, pclk /%d, max exposure %d lines, band %d, jpeg q %d%s\n",
-                camXclkMhz, camPllMul ? camPllMul : 200, camPclkDiv ? camPclkDiv : 4, camMaxExp ? camMaxExp : 984,
+  Serial.printf("camera speed: xclk %d MHz, pll x%d, pclk /%d, line %d, max exposure %d lines, band %d, jpeg q %d%s\n",
+                camXclkMhz, camPllMul ? camPllMul : 200, camPclkDiv ? camPclkDiv : 4, camHts ? camHts : 2644, camMaxExp ? camMaxExp : 984,
                 camBand, camJpegQ, isOV5640 ? "" : " (not an OV5640: only xclk and q apply)");
 }
 
