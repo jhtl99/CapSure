@@ -106,10 +106,19 @@
 #define CAM_AE_LEVEL       2           // -2..2; 2 is the sensor's maximum
 #define CAM_GAIN_X         128         // gain ceiling: 2, 4, 8, 16, 32, 64 or 128 (more = brighter + noisier)
 // Sensor clock. 10 MHz brightened 640x480 on the assumption of a ~60 fps
-// sensor, but at 1280x720 the OV3660 then only manages ~9 fps (measured 11/10).
+// sensor, but at 1280x720 the OV3660 then only managed ~9 fps (measured 11/10).
 // 20 MHz is the full-speed clock. Check "sensor .. fps" in the status line:
 // it needs to stay above ~26 for us to keep 24.
 #define CAM_XCLK_HZ        20000000
+// Frame-rate controls. Tune them live on /live (Speed section), then copy the
+// block it prints here. 0 = keep the camera driver's own value.
+// OV5640 only, except CAM_JPEG_Q.
+#define CAM_PLL_MUL        0           // sensor PLL multiplier; driver: 200. Higher = faster sensor clock (more fps, more heat, may glitch)
+#define CAM_PCLK_DIV       0           // pixel-clock divider; driver: 4. Lower = faster output to the ESP
+#define CAM_MAX_EXP        0           // longest exposure, in sensor lines; driver: 984. A 1280x720 frame is 744 lines,
+                                       // so above that the sensor stretches frames in dim light (fewer fps)
+#define CAM_BAND           0           // flicker filter: 0 = driver (50 Hz), 60 = US mains lights, 50, -1 = off
+#define CAM_JPEG_Q         12          // JPEG quality 8..30: lower = sharper but bigger frames
 #define CC_EV              0.05f       // exposure, stops
 #define CC_TEMP            0.15f       // + warmer
 #define CC_TINT            0.20f       // + magenta (frames lean green)
@@ -183,6 +192,13 @@ volatile bool detEnabled = true;          // 'd' on serial toggles it
 volatile bool sensorColor = SENSOR_COLOR;
 int camBrightness = CAM_BRIGHTNESS, camContrast = CAM_CONTRAST, camSaturation = CAM_SATURATION, camAe = CAM_AE_LEVEL;
 int camGainX = CAM_GAIN_X;
+// frame-rate settings (see CAM_PLL_MUL above) and what they achieve
+int camXclkMhz = CAM_XCLK_HZ / 1000000, camPllMul = CAM_PLL_MUL, camPclkDiv = CAM_PCLK_DIV;
+int camMaxExp = CAM_MAX_EXP, camBand = CAM_BAND, camJpegQ = CAM_JPEG_Q;
+bool isOV5640 = false;
+void applySpeed();
+volatile float rateSensorFps = 0, rateRecFps = 0, rateFrameKB = 0;   // over the last second
+volatile uint32_t detLuma = 0;                                        // mean brightness 0..255 of the last detector frame
 // Footage is only kept while the table is in view. Starts off: nothing is
 // recorded until the first green frame.
 volatile bool recordingActive = !TABLE_GATES_RECORDING;
@@ -272,6 +288,16 @@ void cameraTask(void *) {
     int64_t now = esp_timer_get_time();
     int64_t ts = (int64_t)fb->timestamp.tv_sec * 1000000LL + fb->timestamp.tv_usec;
     if (ts <= 0 || ts > now || now - ts > 500000) ts = now;
+    {                                                        // rolling 1 s rates for /admin/speed
+      static int64_t w0 = 0; static uint32_t wn = 0, wRec0 = 0; static uint64_t wBytes = 0;
+      if (!w0) { w0 = now; wRec0 = framesCaptured; }
+      wn++; wBytes += fb->len;
+      if (now - w0 >= 1000000) {
+        float sec = (now - w0) / 1e6f;
+        rateSensorFps = wn / sec; rateRecFps = (framesCaptured - wRec0) / sec; rateFrameKB = wBytes / 1024.0f / wn;
+        w0 = now; wn = 0; wBytes = 0; wRec0 = framesCaptured;
+      }
+    }
 
     if (previewWant && previewBuf && fb->len <= PREVIEW_MAX) {   // preview may use any frame
       memcpy(previewBuf, fb->buf, fb->len);
@@ -443,12 +469,14 @@ void detectTask(void *) {
     int64_t t0 = esp_timer_get_time();
     bool ok = JPG_TO_565(detBuf, detLen, det565, 3);                  // scale 3 = 1/8: 640x480 -> 80x60
     struct { uint32_t green, total; } c = {0, 0};
+    uint32_t lumaSum = 0;
     if (ok) {
       uint8_t r, g, b;
       for (int i = 0; i < DET_W * DET_H; i++) {
         unpack565(det565 + 2 * i, r, g, b);
         if (!sensorColor) colorCorrect(r, g, b);             // sensor already did it otherwise
         if (isTableColor(r, g, b)) c.green++;            // 'green' = table cloth, green or blue
+        lumaSum += (r * 77 + g * 150 + b * 29) >> 8;
         c.total++;
       }
     }
@@ -456,6 +484,7 @@ void detectTask(void *) {
     if (!ok || !c.total) { if (detVerbose) Serial.println("detect: JPEG decode failed"); continue; }
 
     uint32_t pm = c.green * 1000 / c.total;
+    detLuma = lumaSum / c.total;
     greenPermille = pm;
     detectChecks++;
     // Hysteresis: 10% to switch on, but once on, 7% is enough to count as
@@ -1404,6 +1433,39 @@ static esp_err_t hCamera(httpd_req_t *req) {
   return sendJson(req, 200, String(b));
 }
 
+// GET /admin/speed                         -> frame-rate settings and what they achieve
+// GET /admin/speed?xclk=20&mul=200&pclk=4&maxexp=744&band=60&q=12
+//   Any subset; 0 = the driver's value. fps/kb/luma are averaged over 1 s, so
+//   wait ~2 s after a change before reading them. The /live page drives this.
+static esp_err_t hSpeed(httpd_req_t *req) {
+  const int NONE = -99;
+  int v;
+  bool changed = false;
+  if ((v = queryInt(req, "xclk", NONE)) != NONE) { camXclkMhz = constrain(v, 6, 24); changed = true; }
+  if ((v = queryInt(req, "mul", NONE)) != NONE) { camPllMul = v ? constrain(v, 100, 252) : 0; changed = true; }
+  if ((v = queryInt(req, "pclk", NONE)) != NONE) { camPclkDiv = v ? constrain(v, 2, 16) : 0; changed = true; }
+  if ((v = queryInt(req, "maxexp", NONE)) != NONE) { camMaxExp = v ? constrain(v, 100, 4000) : 0; changed = true; }
+  if ((v = queryInt(req, "band", NONE)) != NONE) { camBand = (v == 50 || v == 60 || v == -1) ? v : 0; changed = true; }
+  if ((v = queryInt(req, "q", NONE)) != NONE) { camJpegQ = constrain(v, 8, 30); changed = true; }
+  if (changed) applySpeed();
+  sensor_t *s = esp_camera_sensor_get();
+  int hts = 0, vts = 0, expo = 0, gain = 0;
+  if (s && isOV5640) {                                        // what the sensor is actually doing
+    hts = s->get_reg(s, 0x380C, 0xFFFF);
+    vts = s->get_reg(s, 0x380E, 0xFFFF);
+    expo = s->get_reg(s, 0x3500, 0xFFFFFF) >> 4;              // lines
+    gain = s->get_reg(s, 0x350A, 0xFFFF) & 0x3FF;             // 16 = 1x
+  }
+  char b[420];
+  snprintf(b, sizeof b, "{\"ov5640\":%s,\"pid\":%d,\"xclk\":%d,\"mul\":%d,\"pclk\":%d,\"maxexp\":%d,\"band\":%d,\"q\":%d,"
+           "\"sensor_fps\":%.1f,\"rec_fps\":%.1f,\"frame_kb\":%.1f,\"luma\":%lu,\"hts\":%d,\"vts\":%d,\"exposure\":%d,"
+           "\"gain_x\":%.1f,\"dropped\":%lu,\"recording\":%s,\"table\":%s}",
+           isOV5640 ? "true" : "false", s ? s->id.PID : 0, camXclkMhz, camPllMul, camPclkDiv, camMaxExp, camBand, camJpegQ,
+           rateSensorFps, rateRecFps, rateFrameKB, (unsigned long)detLuma, hts, vts, expo, gain / 16.0f,
+           (unsigned long)dropped, recordingActive ? "true" : "false", tableDetected ? "true" : "false");
+  return sendJson(req, 200, String(b));
+}
+
 // GET /live : a page that shows what the camera sees (~5 frames/s from
 // /api/preview), whether it counts as the table, and sliders for the sensor
 // settings. Open it in a phone or laptop browser on the CapSure network.
@@ -1488,6 +1550,7 @@ void startApi() {
   regUri("/admin/last", HTTP_GET, hLast);
   regUri("/admin/table", HTTP_GET, hTable);
   regUri("/admin/camera", HTTP_GET, hCamera);
+  regUri("/admin/speed", HTTP_GET, hSpeed);
   regUri("/live", HTTP_GET, hLive);
   regUri("/bench/sd", HTTP_GET, hBenchSd);
   Serial.println("httpd on :80");
@@ -1712,7 +1775,7 @@ void safeShutdown() {
 
 bool wifiSwitchOn() { return !WIFI_SWITCH_ENABLED || digitalRead(WIFI_SW_PIN) == LOW; }
 
-// Push the color settings to the OV2640. With sensorColor off, everything
+// Push the color settings to the sensor. With sensorColor off, everything
 // goes back to neutral and correction happens in software instead.
 void applyCameraTuning() {
   sensor_t *s = esp_camera_sensor_get();
@@ -1731,6 +1794,30 @@ void applyCameraTuning() {
   Serial.printf("camera color: %s (brightness %d, contrast %d, saturation %d, ae %d, gain cap %dx)\n",
                 on ? "corrected on the sensor" : "raw (software correction)",
                 camBrightness, camContrast, camSaturation, camAe, 2 << gi);
+}
+
+// Push the frame-rate settings (CAM_PLL_MUL etc.). Call after set_framesize,
+// which resets the sensor PLL to the driver's values.
+void applySpeed() {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+  s->set_xclk(s, LEDC_TIMER_0, camXclkMhz);
+  s->set_quality(s, camJpegQ);
+  if (isOV5640) {
+    // Same call the driver makes for JPEG at 1280x720, with our multiplier and divider.
+    s->set_pll(s, 0, camPllMul ? camPllMul : 200, 4, 0, 2, 2, 1, camPclkDiv ? camPclkDiv : 4);
+    int me = camMaxExp ? camMaxExp : 984;
+    s->set_reg(s, 0x3A02, 0xFFFF, me);                        // max exposure, 60 Hz mode
+    s->set_reg(s, 0x3A14, 0xFFFF, me);                        // max exposure, 50 Hz mode
+    if (camBand == -1) s->set_reg(s, 0x3A00, 0x20, 0x00);     // banding filter off
+    else {
+      s->set_reg(s, 0x3A00, 0x20, 0x20);
+      s->set_reg(s, 0x3C00, 0x04, camBand == 60 ? 0x00 : 0x04);   // bit 2: 50 Hz
+    }
+  }
+  Serial.printf("camera speed: xclk %d MHz, pll x%d, pclk /%d, max exposure %d lines, band %d, jpeg q %d%s\n",
+                camXclkMhz, camPllMul ? camPllMul : 200, camPclkDiv ? camPclkDiv : 4, camMaxExp ? camMaxExp : 984,
+                camBand, camJpegQ, isOV5640 ? "" : " (not an OV5640: only xclk and q apply)");
 }
 
 void fail(const char *msg) { for (;;) { Serial.println(msg); delay(3000); } }
@@ -1789,7 +1876,7 @@ void setup() {
   c.ledc_timer = LEDC_TIMER_0; c.ledc_channel = LEDC_CHANNEL_0;
   c.pixel_format = PIXFORMAT_JPEG;
   c.frame_size = CAM_FRAMESIZE;         // frame buffers sized for this resolution
-  c.jpeg_quality = 12; c.fb_count = 3;
+  c.jpeg_quality = CAM_JPEG_Q; c.fb_count = 3;
   c.fb_location = CAMERA_FB_IN_PSRAM; c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   if (esp_camera_init(&c) != ESP_OK) fail("Camera init FAILED");
   Serial.printf("[heap] after camera init: %u internal free\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -1801,7 +1888,9 @@ void setup() {
   // set CAM_HMIRROR to 0.
   s->set_vflip(s, CAM_VFLIP);
   s->set_hmirror(s, CAM_HMIRROR);
+  isOV5640 = s->id.PID == 0x5640;
   applyCameraTuning();
+  applySpeed();
 
   i2s.setPinsPdmRx(42, 41);
   if (!i2s.begin(I2S_MODE_PDM_RX, AUDIO_RATE, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) fail("I2S init FAILED");
