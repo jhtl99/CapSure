@@ -22,6 +22,7 @@ import { Banner, Button, Card, Progress, Row } from '../ui/components';
 import { ClipThumb } from '../ui/ClipThumb';
 import { describeDownloadError } from '../ui/messages';
 import { colors, formatDuration, formatWhen, radius, space, type } from '../ui/theme';
+import { AnalysisScreen } from '../cv/AnalysisScreen';
 
 const SWIPE_PX = 56;
 
@@ -198,6 +199,7 @@ function ClipStage({
  * play it, so this is the system player rather than the CAPS1 frame clock.
  */
 function MovPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
+  const [analysisTime, setAnalysisTime] = useState<number | null>(null);
   const file = localClipFile(meta);
   const player = useVideoPlayer(file.uri, (p) => {
     p.loop = false;
@@ -223,6 +225,21 @@ function MovPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
           contentFit="contain"
         />
       </View>
+
+      <Button title="Analyze" onPress={() => {
+        player.pause();
+        setAnalysisTime(Math.min(player.currentTime * 1000, Math.max(0, meta.duration_ms - 100)));
+      }} />
+      {analysisTime !== null ? (
+        <AnalysisScreen clipId={meta.id} initialTimeMs={analysisTime} durationMs={meta.duration_ms}
+          onBack={() => setAnalysisTime(null)} getFrame={async (timeMs) => {
+            const thumbnails = await player.generateThumbnailsAsync(timeMs / 1000);
+            const thumbnail = thumbnails[0];
+            if (!thumbnail) throw new Error('Could not extract this video frame. Try another time.');
+            return { source: thumbnail, width: thumbnail.width, height: thumbnail.height,
+              timeMs: (thumbnail.actualTime ?? thumbnail.requestedTime) * 1000 };
+          }} />
+      ) : null}
 
       <Card style={{ marginTop: space.md }}>
         <Text style={type.heading}>Clip detail</Text>
@@ -315,6 +332,7 @@ function Scrubber({ fraction, onSeek }: { fraction: number; onSeek: (f: number, 
  * audio helps no one. Frame steps pause and move exactly one frame.
  */
 function CapPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
+  const [analysisTime, setAnalysisTime] = useState<number | null>(null);
   const [prepared, setPrepared] = useState<PreparedClip | null>(null);
   const [progress, setProgress] = useState<PrepareProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -507,6 +525,19 @@ function CapPlayer({ meta, onBack }: { meta: ClipMeta; onBack: () => void }) {
       </Pressable>
 
       <Scrubber fraction={fraction} onSeek={seek} />
+      <Button title="Analyze" disabled={!nFrames} onPress={() => {
+        pause();
+        setAnalysisTime(prepared.index.video[frame].ptsUs / 1000);
+      }} />
+      {analysisTime !== null ? (
+        <AnalysisScreen clipId={meta.id} initialTimeMs={analysisTime} durationMs={prepared.durationMs}
+          onBack={() => setAnalysisTime(null)} getFrame={async (timeMs) => {
+            const index = frameIndexAt(prepared.index.video, timeMs * 1000);
+            if (!prepared.frameUris[index]) throw new Error('This clip has no frame at that time.');
+            return { source: { uri: prepared.frameUris[index] }, width: prepared.index.header.width,
+              height: prepared.index.header.height, timeMs: prepared.index.video[index].ptsUs / 1000 };
+          }} />
+      ) : null}
       <View style={styles.timeRow}>
         <Text style={type.mono}>{formatDuration(elapsedMs)}</Text>
         <Text style={type.mono}>{`frame ${frame + 1} / ${nFrames}`}</Text>

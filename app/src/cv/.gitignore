@@ -1,0 +1,5 @@
+# Local footage and generated analysis artifacts
+sample-videos/*
+!sample-videos/.gitkeep
+outputs/
+.venv/
