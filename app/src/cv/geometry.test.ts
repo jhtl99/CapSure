@@ -23,6 +23,19 @@ describe('manual table calibration', () => {
     expect(center.y).toBeCloseTo(0.5, 8);
   });
 
+  it('maps a visible ball using estimated corners outside the image', () => {
+    const camera = [0.55, -0.45, 0.3, 0, 0.48, 0.33, 0, -0.65, 1];
+    const image = corners.map((table) => project(table, camera));
+    expect(image[2].x).toBeGreaterThan(1);
+    expect(image[3].x).toBeLessThan(0);
+    expect(image[3].y).toBeGreaterThan(1);
+    const matrix = calibrate(corners.map((table, i) => ({ image: image[i], table })));
+    const ball = { x: 0.55, y: 0.32 };
+    const restored = project(project(ball, camera), matrix);
+    expect(restored.x).toBeCloseTo(ball.x, 8);
+    expect(restored.y).toBeCloseTo(ball.y, 8);
+  });
+
   it('rejects duplicate or collinear landmarks', () => {
     expect(() => calibrate(corners.map((table) => ({ image: { x: 0.5, y: 0.5 }, table })))).toThrow();
     expect(() => calibrate(corners.map((table, i) => ({ image: { x: i / 4, y: i / 4 }, table })))).toThrow();

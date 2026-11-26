@@ -23,11 +23,16 @@ Open a downloaded clip and tap Analyze. Choose a frame by its time in seconds.
 Movie clips use expo-video frame extraction on iOS and Android. CAPS clips reuse
 the player's unpacked JPEG frames.
 
-Place four landmarks and enter their known overhead coordinates in percent.
-The default positions are the table's four corners in clockwise order from
-top-left. For cropped footage, use visible landmarks with known positions on
-the playing surface. Four arbitrary points require known table coordinates to
-produce a meaningful reconstruction. Avoid three collinear landmarks.
+By default, place the four corners in clockwise order from the top left. For a cropped
+shot, tap **Show space around frame** and estimate the missing corners by
+following the visible rails. Use **More space** if you need more room. Dashed
+markers identify off-frame estimates. Once the four corners are marked, check
+that the table outline follows the rails. You can also use four visible landmarks
+on the playing surface by entering their known table coordinates in percent.
+Avoid three collinear landmarks.
+
+Use **Zoom in** and drag the image to place visible landmarks or ball marks
+more precisely.
 
 Switch to Mark balls and tap the cloth contact point under each visible ball.
 Show overhead view maps those marks onto a 2-to-1 table. Save analysis stores

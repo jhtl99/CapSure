@@ -1,5 +1,6 @@
 import { Directory, File, Paths } from 'expo-file-system';
 import { assertClipId } from '../device/validate';
+import { CALIBRATION_BOUNDS, isInBounds, MAX_CALIBRATION_ZOOM } from './calibrationCanvas';
 import type { Point, ShotAnalysis } from './types';
 
 function analysisFile(clipId: string): File {
@@ -8,18 +9,17 @@ function analysisFile(clipId: string): File {
   return new File(directory, `${assertClipId(clipId)}.json`);
 }
 
-function isPoint(value: unknown): value is Point {
+function isPoint(value: unknown, bounds = CALIBRATION_BOUNDS[0]): value is Point {
   if (!value || typeof value !== 'object') return false;
   const point = value as Point;
-  return Number.isFinite(point.x) && Number.isFinite(point.y)
-    && point.x >= 0 && point.x <= 1 && point.y >= 0 && point.y <= 1;
+  return Number.isFinite(point.x) && Number.isFinite(point.y) && isInBounds(point, bounds);
 }
 
 function validate(value: unknown, clipId: string): ShotAnalysis {
   const data = value as ShotAnalysis | null;
   if (!data || data.version !== 1 || data.clipId !== clipId || !Number.isFinite(data.timeMs)
     || data.timeMs < 0 || !Array.isArray(data.references) || data.references.length !== 4
-    || !data.references.every((r) => r && isPoint(r.image) && isPoint(r.table))
+    || !data.references.every((r) => r && isPoint(r.image, CALIBRATION_BOUNDS[MAX_CALIBRATION_ZOOM]) && isPoint(r.table))
     || !Array.isArray(data.balls) || data.balls.length > 16
     || !data.balls.every((b) => b && Number.isInteger(b.id) && b.id > 0 && isPoint(b.image))
     || new Set(data.balls.map((b) => b.id)).size !== data.balls.length) {

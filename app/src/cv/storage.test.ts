@@ -50,6 +50,26 @@ it('waits for the write and restores the saved analysis', async () => {
   expect(await loadAnalysis(analysis.clipId)).toEqual(analysis);
 });
 
+it('restores estimated landmarks beyond the frame', async () => {
+  const estimated: ShotAnalysis = {
+    ...analysis,
+    references: [
+      ...analysis.references.slice(0, 2),
+      { image: { x: 2.7, y: 2.2 }, table: { x: 1, y: 1 } },
+      { image: { x: -1.8, y: 2.1 }, table: { x: 0, y: 1 } },
+    ],
+  };
+  await saveAnalysis(estimated);
+  expect(await loadAnalysis(estimated.clipId)).toEqual(estimated);
+});
+
+it('rejects off-frame balls and landmarks with out-of-table positions', async () => {
+  await expect(saveAnalysis({ ...analysis, balls: [{ id: 1, image: { x: 0.4, y: 1.1 } }] }))
+    .rejects.toThrow('Saved analysis is invalid');
+  const references = [{ image: { x: -0.1, y: 0 }, table: { x: -0.1, y: 0 } }, ...analysis.references.slice(1)];
+  await expect(saveAnalysis({ ...analysis, references })).rejects.toThrow('Saved analysis is invalid');
+});
+
 it('replaces an existing analysis when saved again', async () => {
   await saveAnalysis(analysis);
   await saveAnalysis({ ...analysis, timeMs: 24500 });

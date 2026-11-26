@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Modal, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Banner, Button, Card } from '../ui/components';
 import { colors, space, type } from '../ui/theme';
+import { FRAME_CENTER, MAX_CALIBRATION_ZOOM, zoomToFitLandmarks } from './calibrationCanvas';
 import { CalibrationView } from './CalibrationView';
 import type { AnalysisFrame } from './CalibrationView';
 import { calibrate, isOnTable, project } from './geometry';
@@ -27,6 +28,12 @@ export function AnalysisScreen({ clipId, initialTimeMs, durationMs, getFrame, on
   const [selected, setSelected] = useState(0);
   const [balls, setBalls] = useState<MarkedBall[]>([]);
   const [mode, setMode] = useState<'calibrate' | 'balls'>('calibrate');
+  const [zoom, setZoom] = useState(0);
+  const [ballScale, setBallScale] = useState(1);
+  const [ballCenter, setBallCenter] = useState(FRAME_CENTER);
+  const [landmarkScale, setLandmarkScale] = useState(1);
+  const [landmarkCenter, setLandmarkCenter] = useState(FRAME_CENTER);
+  const [panning, setPanning] = useState(false);
   const [mapped, setMapped] = useState<{ id: number; position: Point }[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -44,7 +51,9 @@ export function AnalysisScreen({ clipId, initialTimeMs, durationMs, getFrame, on
         if (!mounted.current) return;
         if (previous && previous.timeMs < durationMs) {
           timeMs = previous.timeMs;
-          setPoints(previous.references.map((r) => r.image));
+          const landmarks = previous.references.map((r) => r.image);
+          setPoints(landmarks);
+          setZoom(zoomToFitLandmarks(landmarks));
           setTable(previous.references.map((r) => ({ x: String(r.table.x * 100), y: String(r.table.y * 100) })));
           setBalls(previous.balls);
         }
@@ -92,6 +101,11 @@ export function AnalysisScreen({ clipId, initialTimeMs, durationMs, getFrame, on
         setSelected(0);
         setBalls([]);
         setMode('calibrate');
+        setZoom(0);
+        setBallScale(1);
+        setBallCenter(FRAME_CENTER);
+        setLandmarkScale(1);
+        setLandmarkCenter(FRAME_CENTER);
         changed();
       }
     } catch (e) {
@@ -102,7 +116,7 @@ export function AnalysisScreen({ clipId, initialTimeMs, durationMs, getFrame, on
   }
 
   function references(): ReferencePoint[] {
-    if (points.length !== 4) throw new Error('Place four landmarks in the image.');
+    if (points.length !== 4) throw new Error('Place four table landmarks.');
     return points.map((image, index) => {
       const coordinate = table[index];
       if (!coordinate.x.trim() || !coordinate.y.trim()) throw new Error('Enter both table coordinates for every landmark.');
@@ -163,10 +177,21 @@ export function AnalysisScreen({ clipId, initialTimeMs, durationMs, getFrame, on
     }
   }
 
+  const markingLandmarks = mode === 'calibrate';
+  const canvasZoom = markingLandmarks ? zoom : 0;
+  const frameScale = canvasZoom ? 1 : markingLandmarks ? landmarkScale : ballScale;
+  const setFrameScale = markingLandmarks ? setLandmarkScale : setBallScale;
+  const frameCenter = markingLandmarks ? landmarkCenter : ballCenter;
+  const setFrameCenter = markingLandmarks ? setLandmarkCenter : setBallCenter;
+  const showOutline = markingLandmarks && points.length === 4
+    && table.every(({ x, y }, index) => x.trim() && y.trim()
+      && Number(x) === Number(DEFAULT_TABLE[index].x) && Number(y) === Number(DEFAULT_TABLE[index].y));
+
   return (
     <Modal onRequestClose={onBack} animationType="slide">
     <SafeAreaView style={{ flex: 1, backgroundColor: colors.bg }}>
-    <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+    <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled"
+      scrollEnabled={!panning} disableScrollViewPanResponder={frameScale > 1}>
       <Button title="Back to clip" variant="secondary" onPress={onBack} />
       <Text style={type.title}>Shot analysis</Text>
       <Text style={type.dim}>Choose a clear frame. Calibration and ball marks apply to this frame.</Text>
@@ -178,19 +203,48 @@ export function AnalysisScreen({ clipId, initialTimeMs, durationMs, getFrame, on
       <Button title="Use this frame" onPress={() => void selectFrame()} busy={busy} />
       {frame && !busy ? <>
         <Text style={type.dim}>{`Selected frame at ${(frame.timeMs / 1000).toFixed(3)} s`}</Text>
-        <CalibrationView frame={frame} onPoint={mark} markers={[
-          ...points.map((point, index) => ({ point, label: `L${index + 1}`, color: '#4C8DFF' })),
-          ...balls.map((ball) => ({ point: ball.image, label: `B${ball.id}`, color: '#F2B441' })),
-        ]} />
         <View style={styles.row}>
           <Button title="Landmarks" variant={mode === 'calibrate' ? 'primary' : 'secondary'} onPress={() => setMode('calibrate')} />
           <Button title="Mark balls" variant={mode === 'balls' ? 'primary' : 'secondary'} onPress={() => setMode('balls')} />
         </View>
+        {markingLandmarks ? (
+          <View style={styles.row}>
+            <Button title={zoom ? 'Hide space around frame' : 'Show space around frame'} variant="secondary"
+              onPress={() => setZoom(zoom ? 0 : Math.max(1, zoomToFitLandmarks(points)))} />
+          </View>
+        ) : null}
+        {canvasZoom > 0 ? (
+          <View style={styles.row}>
+            <Button title="Less space" variant="secondary" disabled={zoom === 1} onPress={() => setZoom(zoom - 1)} />
+            <Button title="More space" variant="secondary" disabled={zoom === MAX_CALIBRATION_ZOOM} onPress={() => setZoom(zoom + 1)} />
+          </View>
+        ) : (
+          <View style={styles.row}>
+            <Button title="Zoom in" variant="secondary" disabled={frameScale === 3} onPress={() => setFrameScale(frameScale + 1)} />
+            <Button title="Zoom out" variant="secondary" disabled={frameScale === 1} onPress={() => {
+              if (frameScale === 2) setFrameCenter(FRAME_CENTER);
+              setFrameScale(frameScale - 1);
+            }} />
+            <Text style={type.dim}>{`${frameScale}×`}</Text>
+          </View>
+        )}
+        <Text style={type.dim}>
+          {canvasZoom > 0 ? `Tap the frame or surrounding space to place L${selected + 1}. Dashed markers are estimates.`
+            : markingLandmarks ? `Tap the frame to place or replace L${selected + 1}.`
+              : `Tap the cloth contact point under each ball. ${balls.length} of 16 marked.`}
+          {frameScale > 1 ? ' Drag to move around the frame.' : ''}
+        </Text>
+        <CalibrationView frame={frame} zoom={canvasZoom} onPoint={mark}
+          frameScale={frameScale} frameCenter={frameCenter}
+          onFrameCenter={setFrameCenter} onPanning={setPanning}
+          corners={showOutline ? points : undefined} markers={[
+            ...points.map((point, index) => ({ point, label: `L${index + 1}`, color: colors.accent })),
+            ...balls.map((ball) => ({ point: ball.image, label: `B${ball.id}`, color: colors.warn })),
+          ]} />
         <Card>
           <Text style={type.heading}>Table landmarks</Text>
-          <Text style={type.dim}>Tap four known points on the cloth plane. X runs left to right and Y runs top to bottom in the overhead view. Enter each point's position as a percentage of table width and length.</Text>
-          <Text style={type.dim}>Defaults represent top-left, top-right, bottom-right, bottom-left corners. For cropped views, use visible landmarks with known positions. Keep every group of three points off a single straight line.</Text>
-          <Text style={type.dim}>Each row contains the landmark selector, X percent, then Y percent. Select a landmark and tap the image again to adjust it.</Text>
+          <Text style={type.dim}>Mark the corners clockwise from top left. For a cropped view, estimate missing corners by following the rails, or choose visible landmarks and enter their known table positions.</Text>
+          <Text style={type.dim}>X is the percentage of table width from the left. Y is the percentage of table length from the top. Reselect a landmark to adjust it.</Text>
           {table.map((coordinate, index) => (
             <View key={index} style={styles.row}>
               <Button title={`L${index + 1}${points[index] ? ' ✓' : ''}`} disabled={index > points.length}
@@ -206,7 +260,6 @@ export function AnalysisScreen({ clipId, initialTimeMs, durationMs, getFrame, on
               ))}
             </View>
           ))}
-          <Text style={type.dim}>{mode === 'calibrate' ? `Tap the image to place or replace L${selected + 1}.` : `Tap the cloth contact point under each ball. ${balls.length} of 16 marked. Labels identify your marks.`}</Text>
           <Button title="Undo last ball" variant="secondary" disabled={!balls.length}
             onPress={() => { changed(); setBalls(balls.slice(0, -1)); }} />
         </Card>

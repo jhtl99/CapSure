@@ -3,9 +3,10 @@ export interface Point {
   y: number;
 }
 
-/** Coordinates are fractions of image size or table width and length. */
 export interface ReferencePoint {
+  /** Fraction of image size. Estimates beyond the frame can fall outside [0, 1]. */
   image: Point;
+  /** Fraction of table width and length. */
   table: Point;
 }
 
